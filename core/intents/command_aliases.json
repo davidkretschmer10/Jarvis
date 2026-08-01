@@ -1,0 +1,41 @@
+{
+  "OPEN_APP": [
+    "otevri",
+    "zapni",
+    "spust",
+    "launchni",
+    "nahod"
+  ],
+  "SEARCH_WEB": [
+    "najdi",
+    "vyhledej",
+    "hledej",
+    "searchni"
+  ],
+  "CREATE_PRESENTATION": [
+    "udelej prezentaci",
+    "vytvor prezentaci",
+    "udelej powerpoint"
+  ],
+  "CREATE_FILE": [
+    "vytvor soubor",
+    "udelej soubor",
+    "novy soubor"
+  ],
+  "CONTROL_PC": [
+    "stiskni",
+    "zmackni",
+    "klikni",
+    "screenshot",
+    "snimek obrazovky",
+    "pauzni",
+    "stopni",
+    "prepni"
+  ],
+  "VISION": [
+    "precti obrazovku",
+    "cti obrazovku",
+    "ocr",
+    "co vidis"
+  ]
+}

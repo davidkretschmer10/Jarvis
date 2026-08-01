@@ -1,0 +1,98 @@
+# Professional .gitignore for Python / Windows Desktop App (Jarvis)
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.pyo
+
+# C extensions
+*.so
+
+# Distribution / packaging
+bin/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+*.spec
+
+# Virtual Environments
+.venv/
+venv/
+venv311/
+ENV/
+env/
+ENV/local/
+ENV/shared/
+
+# IDEs and Editors
+.vs/
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.project
+.pydevproject
+.settings/
+
+# Local configuration & Secrets
+.env
+.env.*
+!.env.example
+config.json
+
+# Log files and Debug outputs
+logs/
+*.log
+test_output*.log
+
+# Windows specific system files
+Thumbs.db
+Desktop.ini
+
+# Large assets, ML models, and audio outputs (keep out of git)
+*.onnx
+*.onnx.json
+*.wav
+*.mp3
+Voice/user_voice_*.wav
+jarvis_voice.mp3
+screenshots/
+picture/
+
+# Caches
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local runtime state and databases
+app_memory.json
+jarvis_chats.json
+jarvis_profile.json
+jarvis_settings.json
+apps_cache.json
+user_preferences.json
+
+# Legacy / Archive directory
+archive/

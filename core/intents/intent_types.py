@@ -1,0 +1,12 @@
+from enum import Enum
+
+
+class IntentType(Enum):
+    CHAT = "CHAT"
+    OPEN_APP = "OPEN_APP"
+    SEARCH_WEB = "SEARCH_WEB"
+    CREATE_FILE = "CREATE_FILE"
+    CREATE_PRESENTATION = "CREATE_PRESENTATION"
+    CONTROL_PC = "CONTROL_PC"
+    VISION = "VISION"
+    UNKNOWN = "UNKNOWN"

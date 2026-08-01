@@ -1,0 +1,445 @@
+Prompt:
+
+Uprav moji Python kalkulačku (Tkinter GUI + oddělená logika), aby doplnila funkce do pravého oranžového sloupce a přidala jednoduché ikonky:
+
+➕ Funkce do pravého sloupce
+
+Nahraď prázdná tlačítka těmito funkcemi:
+
+Mocnina (x² nebo ^)
+tlačítko zobrazí např. „x²“
+po kliknutí umocní aktuální číslo na druhou
+alternativně může přidat znak ** pro obecnou mocninu
+Odmocnina (√)
+tlačítko „√“
+vypočítá druhou odmocninu z aktuální hodnoty
+pokud je číslo záporné → zobraz „Chyba“
+Závorky ( )
+tlačítko „( )“
+přidává závorky do výrazu (např. postupně vkládá "(" a ")")
+Desetinná tečka (.)
+tlačítko „.“
+přidá desetinnou tečku do čísla
+🧠 Logika (logic.py)
+všechny výpočty implementuj v logic.py
+přidej nové funkce:
+odmocnina
+mocnina
+přidání závorek
+přidání tečky
+ošetři chyby (např. špatný vstup, odmocnina ze záporného čísla)
+🖥️ GUI (gui.py)
+napoj tlačítka na funkce z logic.py
+zachovej responzivní layout (grid, weight)
+🎨 Ikonky / vizuál
+místo textu použij:
+„√“ pro odmocninu
+„x²“ pro mocninu
+„( )“ pro závorky
+„.“ pro tečku
+případně použij Unicode znaky nebo malé obrázky (ikony), pokud to Tkinter dovolí
+zachovej tmavý design
+📝 Navíc:
+přidej komentáře ke všem novým funkcím
+stručně vysvětli:
+jak funguje odmocnina
+jak funguje mocnina
+jak přidat další funkce
+
+
+
+fynalní produkt Chci vytvořit pokročilého lokálního AI desktop asistenta „Jarvis“ pro Windows.
+
+Nejde o obyčejný chatbot.
+
+Cíl projektu:
+
+* AI assistant,
+* voice assistant,
+* autonomous desktop agent,
+* dlouhodobě vlastní AI prostředí / AI OS.
+
+Jarvis musí:
+
+* mluvit česky,
+* poslouchat mikrofon,
+* odpovídat hlasem,
+* používat lokální AI modely přes Ollama,
+* vidět obrazovku,
+* chápat UI aplikací,
+* ovládat počítač,
+* plánovat úkoly,
+* pracovat autonomně.
+
+Projekt už obsahuje:
+
+* GUI v PySide6,
+* voice pipeline,
+* faster-whisper,
+* Piper TTS,
+* wake word,
+* multi-model AI routing,
+* autonomous agent tools,
+* screenshot systém,
+* vision system,
+* UI detection layer,
+* debug overlay,
+* personality system,
+* multi-agent merge,
+* local storage.
+
+Chci pokračovat dlouhodobou modulární architekturou.
+
+Důležité:
+
+* nevytvářej fake implementace,
+* nepoužívej placeholdery,
+* zachovej modulární architekturu,
+* nepiš quick hacky,
+* nepiš spaghetti code,
+* navrhuj production-ready strukturu.
+
+Finální vize projektu:
+
+# 1. CHAT MODE
+
+Klasické desktop GUI:
+
+* chat,
+* historie,
+* modely,
+* settings,
+* tools.
+
+---
+
+# 2. VOICE OVERLAY MODE
+
+Jarvis běží na pozadí Windows jako overlay.
+
+Po aktivaci:
+
+* zobrazí se malá glowing Jarvis ikona,
+* poslouchá hlas,
+* mluví,
+* reaguje realtime,
+* funguje i během hraní her nebo práce.
+
+Chci:
+
+* floating orb,
+* waveform animation,
+* speaking animation,
+* thinking state,
+* action feedback.
+
+Například:
+
+* „Poslouchám...“
+* „Otevírám Chrome...“
+* „Hotovo.“
+
+Overlay musí být:
+
+* minimalistický,
+* moderní,
+* futuristický,
+* neotravující.
+
+---
+
+# 3. AI DESKTOP AGENT
+
+Jarvis musí:
+
+* otevřít aplikace,
+* hledat na internetu,
+* pracovat se soubory,
+* číst obrazovku,
+* rozpoznávat UI elementy,
+* používat vision model,
+* analyzovat screenshoty,
+* ovládat Windows.
+
+Nechci fixní coordinates.
+
+Chci:
+
+* AI UI understanding,
+* observation loop,
+* retry logic,
+* state tracking.
+
+Flow:
+ACTION → SCREENSHOT → VISION → VALIDATION → NEXT ACTION
+
+---
+
+# 4. PLANNER SYSTEM
+
+Jarvis musí:
+
+* dostat cíl,
+* rozdělit ho na kroky,
+* postupně ho splnit.
+
+Například:
+„Pošli PDF na Discord“
+
+↓
+
+1. otevři Discord
+2. najdi chat
+3. klikni upload
+4. vyber soubor
+5. odešli
+
+Planner musí obsahovat:
+
+* task decomposition,
+* state tracking,
+* retry system,
+* failure recovery,
+* autonomous workflows.
+
+---
+
+# 5. MEMORY SYSTEM
+
+Jarvis si musí:
+
+* pamatovat preference,
+* pamatovat předchozí úkoly,
+* chápat dlouhodobý kontext,
+* ukládat episodic memory.
+
+Chci:
+
+* short-term memory,
+* long-term memory,
+* semantic memory,
+* vector search.
+
+---
+
+# 6. PLUGIN SYSTEM
+
+Jarvis musí být rozšiřitelný.
+
+Pluginy například:
+
+* Discord,
+* Spotify,
+* Browser,
+* Steam,
+* Home Assistant.
+
+Chci:
+
+* dynamic tool registry,
+* plugin loading,
+* isolated modules,
+* clean interfaces.
+
+---
+
+# 7. AI OS / AI ENVIRONMENT
+
+Dlouhodobý cíl:
+po zapnutí počítače se otevře AI prostředí Jarvise.
+
+Ne klasický Windows UX.
+
+Jarvis bude:
+
+* fullscreen AI shell,
+* AI launcher,
+* AI desktop overlay,
+* voice-first environment.
+
+Windows může běžet na pozadí.
+
+Jarvis bude hlavní vrstva systému.
+
+---
+
+# DŮLEŽITÉ ARCHITEKTONICKÉ PRINCIPY
+
+Projekt musí mít vrstvy:
+
+GUI Layer
+Voice Layer
+AI Layer
+Vision Layer
+Agent Layer
+Planner Layer
+Memory Layer
+Plugin Layer
+OS Integration Layer
+Core Infrastructure
+
+---
+
+# DŮLEŽITÉ TECHNICKÉ POŽADAVKY
+
+* modulární architektura,
+* async-ready design,
+* logging,
+* validation layers,
+* schema validation,
+* structured outputs,
+* retry systems,
+* error handling,
+* clean separation of concerns.
+
+---
+
+# UX / PERSONALITY
+
+Jarvis musí:
+
+* vždy mluvit česky,
+* být stručný,
+* technický,
+* klidný,
+* lehce futuristický,
+* ne korporátní chatbot.
+
+Ne:
+
+* „Certainly!“
+* „I’d be happy to help“
+
+Ale:
+
+* „Hotovo.“
+* „Chrome je otevřený.“
+* „Našel jsem problém.“
+
+---
+
+# PRIORITY VÝVOJE
+
+1. GUI + Voice UX
+2. Overlay mode
+3. Observation loop
+4. Agent reliability
+5. Planner system
+6. Memory system
+7. Plugins
+8. AI OS layer
+
+---
+
+Při návrhu:
+
+* vždy navrhuj malé milestones,
+* vždy zachovej stabilitu projektu,
+* vždy preferuj čistou architekturu před rychlým hackem.
+
+Projekt není chatbot.
+
+Projekt je:
+lokální AI desktop architecture / AI operating assistant.
+
+
+
+
+
+
+
+
+
+Jsi zkušený AI architekt a Python developer. Pomáháš mi stavět pokročilého AI asistenta (Jarvise), který funguje jako autonomní agent, ne jen chatbot.
+
+🎯 CÍL:
+Chci vytvořit modulární AI systém (Jarvis), který:
+
+* běží jako „mozek“ (AI + plánování)
+* používá nástroje (tools) pro vykonávání akcí
+* dokáže ovládat počítač, pracovat se soubory, tvořit obsah a komunikovat
+
+🏗️ AKTUÁLNÍ STAV:
+
+* Mám Python projekt s:
+
+  * Flask API pro ovládání PC (otevírání aplikací, psaní, klikání)
+  * multi-agent AI systém (více modelů přes Ollama)
+  * GUI aplikaci (PySide6)
+  * voice systém (speech-to-text + text-to-speech)
+  * základní autonomous agent (plán → akce → execute)
+* Projekt už funguje, ale není dobře škálovatelný
+
+⚠️ PROBLÉM:
+
+* Kód je moc monolitický
+* Agent umí jen jednoduché akce (např. open app)
+* Chybí:
+
+  * tool system (modulární nástroje)
+  * multi-step planning
+  * práce se soubory a dokumenty
+
+🚀 CO CHCI:
+Chci přejít na ARCHITEKTURU:
+
+1. CORE (mozek)
+
+* rozhoduje co dělat
+* plánuje kroky
+* vybírá tools
+
+2. TOOLS (moduly)
+   Každý tool je samostatný Python soubor:
+
+* create_docx (Word dokumenty)
+* create_pptx (PowerPoint)
+* run_blender_script
+* file_manager (čtení/ukládání souborů)
+* open_app, write_text, click (už existují)
+
+3. TOOL REGISTRY
+
+* centrální mapa toolů
+* AI si vybírá tool podle názvu
+
+4. AGENT (multi-step)
+
+* rozloží úkol na více kroků
+* vrací JSON seznam akcí
+
+📌 PŘÍKLAD:
+Uživatel:
+"Vytvoř prezentaci o Karlově mostě"
+
+Agent:
+[
+{"tool": "search_info", "input": "Karlův most"},
+{"tool": "create_pptx", "input": "prezentace o Karlově mostě"},
+{"tool": "save_file", "input": "karluv_most.pptx"}
+]
+
+🧠 JAK MÁŠ ODPOVÍDAT:
+
+* NEPIŠ celý kód najednou
+* vysvětluj krok za krokem
+* navrhuj architekturu a zlepšení
+* dávej konkrétní změny do mého kódu
+* piš jednoduše a prakticky (ne teorie)
+* když něco není dobrý nápad → řekni to narovinu
+
+❗ DŮLEŽITÉ:
+
+* jsem spíš začátečník v programování
+* preferuji, když mi radíš co napsat, ne že mi napíšeš celý projekt
+* chci se to naučit, ne jen zkopírovat
+
+🔥 CÍL NAŠÍ KONVERZACE:
+Postupně vybudovat plně funkčního Jarvise, který:
+
+* umí používat tools
+* umí plánovat úkoly
+* umí tvořit dokumenty, 3D modely a pracovat se systémem
+* může běžet na druhém PC jako server
+
+Začni tím, že mi navrhneš první konkrétní krok refaktoringu na tool-based architekturu.

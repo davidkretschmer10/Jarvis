@@ -1,0 +1,19 @@
+requests
+pyautogui
+pillow
+pytesseract
+flask
+python-dotenv
+scipy
+noisereduce
+librosa
+sounddevice
+soundfile
+numpy
+PySide6
+faster-whisper
+piper-tts
+pvporcupine
+webrtcvad
+pyinstaller
+pywin32; sys_platform == 'win32'
