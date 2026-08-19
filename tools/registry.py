@@ -78,3 +78,50 @@ class ToolRegistry:
         except Exception as e:
             return {"ok": False, "error": f"{type(e).__name__}: {e}"}
 
+
+def build_default_registry() -> ToolRegistry:
+    """Create the standard Jarvis tool registry used by CLI, GUI, and voice."""
+    from tools.file_manager import ListDirTool, ReadTextFileTool, WriteTextFileTool
+    from tools.pc_control import (
+        AgentHealthTool,
+        CancelDialogTool,
+        ClickTool,
+        CloseWindowTool,
+        ConfirmDialogTool,
+        HotkeyTool,
+        OpenAppTool,
+        OpenSearchResultTool,
+        OpenWebsiteTool,
+        PressKeyTool,
+        ReadScreenTool,
+        RefreshAppsTool,
+        ScreenshotTool,
+        SmartCheckboxTool,
+        SmartClickTool,
+        SmartWriteTool,
+        WriteTextTool,
+    )
+
+    reg = ToolRegistry()
+    reg.register(AgentHealthTool())
+    reg.register(OpenAppTool())
+    reg.register(WriteTextTool())
+    reg.register(ClickTool())
+    reg.register(OpenWebsiteTool())
+    reg.register(PressKeyTool())
+    reg.register(HotkeyTool())
+    reg.register(ScreenshotTool())
+    reg.register(ReadScreenTool())
+    reg.register(SmartClickTool())
+    reg.register(SmartWriteTool())
+    reg.register(SmartCheckboxTool())
+    reg.register(CloseWindowTool())
+    reg.register(ConfirmDialogTool())
+    reg.register(CancelDialogTool())
+    reg.register(OpenSearchResultTool())
+    reg.register(ListDirTool())
+    reg.register(ReadTextFileTool())
+    reg.register(WriteTextFileTool())
+    reg.register(RefreshAppsTool())
+    return reg
+

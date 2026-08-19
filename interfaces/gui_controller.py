@@ -6,11 +6,11 @@ import unicodedata
 
 from PySide6.QtCore import QObject, QTimer, Signal
 
-from ai.engine import generate_stream, send_agent_command
+from ai.engine import generate_stream
 from ai.model_manager import save_settings
 from ai.prompts.master_prompt import build_user_task_prompt
-from core.autonomous_agent import AutonomousAgent
 from core.memory import CHATS_FILE, PROFILE_FILE, load_json, save_json, update_profile
+from core.runtime import JarvisRuntime
 from interfaces.voice import (
     interrupt_speech,
     listen_once_to_text,
@@ -77,7 +77,7 @@ class GuiController(QObject):
         self.current_chat = list(self.chats.keys())[0]
         self.recording = False
         self.voice_active = False
-        self.agent = AutonomousAgent()
+        self.runtime = JarvisRuntime(event_bus=event_bus)
         self.voice_read_enabled = False
         self.pending_router_choice = None
 
@@ -211,6 +211,56 @@ class GuiController(QObject):
                             chosen_candidate = cand
                             break
             
+            if (is_yes or chosen_candidate) and "executor" not in task_info:
+                self.paused_task = None
+                if chosen_candidate:
+                    state.data["pending_app_path"] = chosen_candidate["path"]
+                    state.data["pending_app_name"] = chosen_candidate["name"]
+
+                def resume_task():
+                    self.status_changed.emit("Provadim...")
+                    self.start_ai_bubble.emit()
+
+                    def update_gui(idx: int, status: str):
+                        self.step_updated.emit(idx, status)
+
+                    try:
+                        result = self.runtime.resume_task(
+                            goal=task_info["goal"],
+                            steps=task_info["steps"],
+                            state=state,
+                            start_index=task_info["step_index"],
+                            on_step_update=update_gui,
+                            on_task_start=lambda task_goal, steps: self.task_started.emit(task_goal, steps),
+                        )
+                    except Exception as e:
+                        summary = f"Neocekavana chyba pri provadeni ukolu: {e}"
+                        success = False
+                    else:
+                        summary = result.summary
+                        success = result.ok
+                        if result.pending_confirmation:
+                            self.paused_task = {
+                                "steps": result.steps,
+                                "state": result.state,
+                                "step_index": result.state.data.get("paused_step_index", 0),
+                                "goal": result.goal,
+                            }
+
+                    self.chunk_received.emit(summary)
+                    if self.voice_read_enabled:
+                        speak(summary)
+                    self.end_ai_bubble.emit()
+                    self.chats[self.current_chat]["messages"].append(f"Jarvis: {summary}")
+                    save_json(CHATS_FILE, self.chats)
+                    self.status_changed.emit("Ready")
+                    self.task_finished.emit(success, summary)
+                    self.event_bus.emit("ai_response", summary)
+
+                threading.Thread(target=resume_task, daemon=True).start()
+                self.clear_input.emit()
+                return
+
             if is_yes or chosen_candidate:
                 self.paused_task = None
                 if chosen_candidate:
@@ -301,7 +351,7 @@ class GuiController(QObject):
 
         self.event_bus.emit("ai_request", message)
 
-    def process_agent_request(self, parsed):
+    def _legacy_process_agent_request(self, parsed):
         self.clear_input.emit()
         
         def agent_task():
@@ -522,6 +572,76 @@ class GuiController(QObject):
             self.event_bus.emit("ai_response", summary)
             
         import threading
+        t = threading.Thread(target=agent_task, daemon=True)
+        t.start()
+        return t
+
+    def process_agent_request(self, parsed):
+        self.clear_input.emit()
+
+        def agent_task():
+            goal = parsed.original_text
+            self.status_changed.emit("Provadim...")
+
+            def update_gui(idx: int, status: str):
+                self.step_updated.emit(idx, status)
+
+            try:
+                result = self.runtime.run_task(
+                    goal,
+                    on_step_update=update_gui,
+                    on_task_start=lambda task_goal, steps: self.task_started.emit(task_goal, steps),
+                    reset_request=False,
+                )
+            except Exception as e:
+                summary = f"Neocekavana chyba pri provadeni ukolu: {e}"
+                self.chunk_received.emit(summary)
+                self.end_ai_bubble.emit()
+                self.status_changed.emit("Ready")
+                self.chats[self.current_chat]["messages"].append(f"Jarvis: {summary}")
+                save_json(CHATS_FILE, self.chats)
+                self.task_finished.emit(False, summary)
+                self.event_bus.emit("ai_response", summary)
+                return
+
+            if result.pending_confirmation and result.state.data.get("router_candidates"):
+                from core.intents.target_extractor import normalize_text
+
+                self.pending_router_choice = {
+                    "query": "prohlizec" if "prohlizec" in normalize_text(goal) else "browser",
+                    "candidates": result.state.data.get("router_candidates", []),
+                    "original_text": goal,
+                }
+                prompt_msg = result.confirmation_message + "\nKtery chces otevrit?"
+                self.chunk_received.emit(prompt_msg)
+                self.end_ai_bubble.emit()
+                self.chats[self.current_chat]["messages"].append(f"Jarvis: {prompt_msg}")
+                save_json(CHATS_FILE, self.chats)
+                self.status_changed.emit("Ready")
+                self.event_bus.emit("ai_response", prompt_msg)
+                if self.voice_read_enabled or (hasattr(self, "voice_active") and self.voice_active):
+                    speak(prompt_msg)
+                return
+
+            if result.pending_confirmation:
+                self.paused_task = {
+                    "steps": result.steps,
+                    "state": result.state,
+                    "step_index": result.state.data.get("paused_step_index", 0),
+                    "goal": goal,
+                }
+
+            self.chunk_received.emit(result.summary)
+            if self.voice_read_enabled or (hasattr(self, "voice_active") and self.voice_active):
+                speak(result.summary)
+
+            self.end_ai_bubble.emit()
+            self.chats[self.current_chat]["messages"].append(f"Jarvis: {result.summary}")
+            save_json(CHATS_FILE, self.chats)
+            self.status_changed.emit("Ready")
+            self.task_finished.emit(result.ok, result.summary)
+            self.event_bus.emit("ai_response", result.summary)
+
         t = threading.Thread(target=agent_task, daemon=True)
         t.start()
         return t

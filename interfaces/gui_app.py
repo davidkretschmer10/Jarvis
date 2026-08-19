@@ -1,15 +1,14 @@
 import sys
 from PySide6.QtWidgets import QApplication
 
-from ai.engine import start_ollama, ensure_models
+from core.startup import ensure_ai_engine_started
 from interfaces.gui_controller import GuiController
 from interfaces.gui.main_window import JarvisMainWindow
 from core.event_bus import EventBus
 
 def start_gui():
     print("Starting AI engine...")
-    start_ollama()
-    ensure_models()
+    ensure_ai_engine_started()
     print("AI ready")
 
     app = QApplication(sys.argv)

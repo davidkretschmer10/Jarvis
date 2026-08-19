@@ -1,4 +1,4 @@
-from ai.engine import ask_ai, send_agent_command
+from ai.engine import ask_ai
 from utils.json_utils import extract_first_json_array
 from utils.helpers import normalize_name
 import time
@@ -186,13 +186,26 @@ Return ONLY the correct app name.
         if action == "think":
             return ask_ai(value)
 
-        if action == "open":
-            resolved = self.resolve_app_name(value)
-            print(f"RESOLVED: {value} -> {resolved}")
-            return send_agent_command("open", resolved)
+        tool_map = {
+            "open": ("open_app", {"name": self.resolve_app_name(value)}),
+            "write": ("write_text", {"text": value}),
+            "click": ("click", value if isinstance(value, dict) else {}),
+            "website": ("open_website", {"url": value}),
+            "press": ("press_key", {"key": value}),
+            "hotkey": ("hotkey", {"keys": value if isinstance(value, list) else [value]}),
+            "screenshot": ("screenshot", value if isinstance(value, dict) else {}),
+            "read_screen": ("read_screen", value if isinstance(value, dict) else {}),
+        }
 
-        if action in ["write", "click", "website", "press", "hotkey", "screenshot", "read_screen"]:
-            return send_agent_command(action, value)
+        if action in tool_map:
+            from core.state import JarvisState
+            from tools.base import ToolContext
+            from tools.registry import build_default_registry
+
+            tool_name, tool_input = tool_map[action]
+            if action == "open":
+                print(f"RESOLVED: {value} -> {tool_input['name']}")
+            return build_default_registry().run(tool_name, tool_input, ToolContext(), JarvisState())
 
         return f"Unknown action: {action}"
 
