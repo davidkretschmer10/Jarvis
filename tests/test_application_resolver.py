@@ -143,10 +143,28 @@ class TestApplicationResolver(unittest.TestCase):
         with open(self.cache_file, "w", encoding="utf-8") as f:
             json.dump({}, f)
 
-        with patch.object(self.resolver, "scan_start_menu", return_value={"notepad": notepad_path}):
+        with patch.object(self.resolver, "scan_start_menu", return_value={"notepad": notepad_path}), \
+             patch.object(self.resolver, "scan_registry_app_paths", return_value={}):
             res = self.resolver.resolve("notepad")
             self.assertTrue(res.found)
             self.assertEqual(res.path, notepad_path)
+
+    def test_start_menu_priority_and_system_scan_isolation(self):
+        """Verify test Start Menu data is returned and host system scans are isolated."""
+        test_notepad_path = os.path.join(self.temp_dir.name, "custom_notepad.exe")
+        self.create_dummy_file(test_notepad_path)
+
+        with open(self.cache_file, "w", encoding="utf-8") as f:
+            json.dump({}, f)
+
+        with patch.object(self.resolver, "scan_start_menu", return_value={"notepad": test_notepad_path}) as mock_sm, \
+             patch.object(self.resolver, "scan_registry_app_paths", return_value={}) as mock_reg:
+            res = self.resolver.resolve("notepad")
+            self.assertTrue(res.found)
+            self.assertEqual(res.path, test_notepad_path)
+            mock_sm.assert_called()
+            mock_reg.assert_called()
+
 
     # 7. Registry Fallback
     def test_registry_fallback(self):

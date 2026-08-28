@@ -804,3 +804,9 @@ def get_application_resolver() -> ApplicationResolver:
     if _resolver_instance is None:
         _resolver_instance = ApplicationResolver()
     return _resolver_instance
+
+
+def reset_application_resolver() -> None:
+    global _resolver_instance
+    _resolver_instance = None
+

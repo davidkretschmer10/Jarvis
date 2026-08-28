@@ -4,8 +4,10 @@ import json
 import os
 from typing import Any, Dict, List
 
-DATA_DIR = os.path.join(os.getenv("APPDATA", ""), "Jarvis")
-TASK_MEMORY_FILE = os.path.join(DATA_DIR, "jarvis_task_memory.json")
+from core.services.application_resolver import get_default_appdata_path
+
+TASK_MEMORY_FILE = get_default_appdata_path("jarvis_task_memory.json")
+DATA_DIR = os.path.dirname(TASK_MEMORY_FILE)
 
 class TaskMemory:
     def __init__(self) -> None:

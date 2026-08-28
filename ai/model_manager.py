@@ -1,9 +1,10 @@
 import json
 import os
 
+from core.services.application_resolver import get_default_appdata_path
 
-DATA_DIR = os.path.join(os.getenv("APPDATA", ""), "Jarvis")
-SETTINGS_FILE = os.path.join(DATA_DIR, "jarvis_settings.json")
+SETTINGS_FILE = get_default_appdata_path("jarvis_settings.json")
+DATA_DIR = os.path.dirname(SETTINGS_FILE)
 
 DEFAULT_SETTINGS = {
     "mode": "auto",

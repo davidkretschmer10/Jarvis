@@ -7,90 +7,19 @@ from typing import Any, Optional
 import uuid
 import threading
 
-# Future Brain V2 Note:
-# Current implementation uses thread-local RequestContext.
-# Future versions should migrate to explicit Request IDs and context management shared across:
-# - Desktop Chat
-# - Voice Mode
-# - Overlay Mode
-# - Autonomous Tasks
-# - Multi-Agent Systems
-# The current implementation should remain fully backward compatible.
-
-import weakref
-
-class RequestContext:
-    _instances = weakref.WeakSet()
-
-    def __init__(self):
-        self.request_id = uuid.uuid4().hex[:8]
-        self.start_time = time.time()
-        self.completed = False
-        self.cancelled = False
-        self.failed = False
-        RequestContext._instances.add(self)
-
-    @classmethod
-    def get_active_count(cls) -> int:
-        return len(cls._instances)
-
-_thread_local = threading.local()
-
-def get_current_request() -> RequestContext:
-    if not hasattr(_thread_local, "context"):
-        _thread_local.context = RequestContext()
-    return _thread_local.context
-
-def get_current_request_or_none() -> Optional[RequestContext]:
-    if hasattr(_thread_local, "context"):
-        return _thread_local.context
-    return None
-
-def reset_current_request() -> RequestContext:
-    old_ctx = get_current_request_or_none()
-    if old_ctx and not (old_ctx.completed or old_ctx.cancelled or old_ctx.failed):
-        print(f"[REQUEST]\nPrevious request still active\n\nRequest ID:\n{old_ctx.request_id}\n\nAction:\ncancel previous request\n")
-        old_ctx.cancelled = True
-    
-    _thread_local.context = RequestContext()
-    print(f"[REQUEST]\nNew request started\n\nRequest ID:\n{_thread_local.context.request_id}\n")
-    return _thread_local.context
-
-def complete_current_request() -> None:
-    req = get_current_request()
-    if not (req.completed or req.cancelled or req.failed):
-        req.completed = True
-        duration = time.time() - req.start_time
-        print(f"[REQUEST]\nCompleted\n\nRequest ID:\n{req.request_id}\n\nDuration:\n{duration:.2f}s\n")
-        try:
-            from core.intents.fast_command_router import update_request_stat
-            update_request_stat("completed")
-        except Exception:
-            pass
-
-def cancel_current_request() -> None:
-    req = get_current_request()
-    if not (req.completed or req.cancelled or req.failed):
-        req.cancelled = True
-        duration = time.time() - req.start_time
-        print(f"[REQUEST]\nCancelled\n\nRequest ID:\n{req.request_id}\n\nDuration:\n{duration:.2f}s\n")
-        try:
-            from core.intents.fast_command_router import update_request_stat
-            update_request_stat("cancelled")
-        except Exception:
-            pass
-
-def fail_current_request() -> None:
-    req = get_current_request()
-    if not (req.completed or req.cancelled or req.failed):
-        req.failed = True
-        duration = time.time() - req.start_time
-        print(f"[REQUEST]\nFailed\n\nRequest ID:\n{req.request_id}\n\nDuration:\n{duration:.2f}s\n")
-        try:
-            from core.intents.fast_command_router import update_request_stat
-            update_request_stat("failed")
-        except Exception:
-            pass
+from core.lifecycle import (
+    InvalidStateTransitionError,
+    RequestContext,
+    RequestStatus,
+    cancel_current_request,
+    check_request_context_block,
+    complete_current_request,
+    fail_current_request,
+    get_current_request,
+    get_current_request_or_none,
+    reset_current_request,
+    set_current_request,
+)
 
 import requests
 from requests.adapters import HTTPAdapter

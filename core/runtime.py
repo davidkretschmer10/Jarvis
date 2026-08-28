@@ -5,14 +5,16 @@ import os
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from ai.engine import (
+from core.executor import Executor
+from core.intents.fast_command_router import classify_routing_level, increment_router_stat
+from core.lifecycle import (
+    RequestContext,
+    RequestStatus,
     complete_current_request,
     fail_current_request,
     get_current_request,
     reset_current_request,
 )
-from core.executor import Executor
-from core.intents.fast_command_router import classify_routing_level, increment_router_stat
 from core.planner import Planner
 from core.state import JarvisState
 from core.task_memory import TaskMemory
@@ -69,11 +71,24 @@ class JarvisRuntime:
         reset_request: bool = True,
     ) -> RuntimeResult:
         if reset_request:
-            reset_current_request()
+            ctx = reset_current_request(goal=goal, source="runtime")
+        else:
+            ctx = get_current_request()
+            if hasattr(ctx, "goal"):
+                ctx.goal = goal
 
+        request_id = getattr(ctx, "request_id", "")
         state = state or JarvisState()
-        request_id = get_current_request().request_id
+
         self._emit("task_requested", {"goal": goal, "request_id": request_id})
+        self._emit("request_created", {"goal": goal, "request_id": request_id})
+
+        # --- ROUTING ---
+        if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
+            try:
+                ctx.transition_to(RequestStatus.ROUTING, event_bus=self.event_bus)
+            except Exception:
+                pass
 
         started = time.perf_counter()
         route_info = classify_routing_level(goal)
@@ -86,9 +101,30 @@ class JarvisRuntime:
         fallback_reason: Optional[str] = None
         use_task_memory = False
 
+        self._emit(
+            "routing_completed",
+            {
+                "request_id": request_id,
+                "route": level,
+                "confidence": confidence,
+                "candidates": candidates,
+            },
+        )
+
         if confidence < 0.70 and candidates:
             message = "Nalezl jsem vice moznosti:\n" + "\n".join(f"* {c}" for c in candidates)
             state.data["router_candidates"] = list(candidates)
+            if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
+                try:
+                    ctx.transition_to(
+                        RequestStatus.WAITING_FOR_USER,
+                        event_bus=self.event_bus,
+                        message=message,
+                        candidates=candidates,
+                    )
+                except Exception:
+                    pass
+
             return RuntimeResult(
                 ok=False,
                 goal=goal,
@@ -103,23 +139,47 @@ class JarvisRuntime:
                 confirmation_message=message,
             )
 
+        # --- PLANNING or DIRECT EXECUTING ---
         if level == "FAST_COMMAND":
             if step:
                 steps = [step]
                 self._emit("route_selected", {"route": level, "confidence": confidence, "steps": steps})
+                if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
+                    try:
+                        ctx.transition_to(RequestStatus.EXECUTING, event_bus=self.event_bus)
+                    except Exception:
+                        pass
             else:
                 level = "MINI_PLANNER"
                 fallback_occurred = True
                 fallback_reason = "FAST_COMMAND step was not generated"
 
         if level == "MINI_PLANNER":
+            if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
+                try:
+                    ctx.transition_to(RequestStatus.PLANNING, event_bus=self.event_bus)
+                except Exception:
+                    pass
             steps, level, fallback_occurred, fallback_reason = self._plan_with_fallback(
                 goal, level, fallback_occurred, fallback_reason
             )
 
         if level == "PLANNER_V2":
             use_task_memory = True
+            if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
+                try:
+                    ctx.transition_to(RequestStatus.PLANNING, event_bus=self.event_bus)
+                except Exception:
+                    pass
             steps = Planner(registry=self.registry).plan(goal)
+
+        if steps and level in ("MINI_PLANNER", "PLANNER_V2"):
+            self._emit("planning_completed", {"request_id": request_id, "steps_count": len(steps), "steps": steps})
+            if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
+                try:
+                    ctx.transition_to(RequestStatus.EXECUTING, event_bus=self.event_bus)
+                except Exception:
+                    pass
 
         elapsed = time.perf_counter() - started
         increment_router_stat(
@@ -146,7 +206,7 @@ class JarvisRuntime:
                 fallback_reason=fallback_reason,
             )
 
-        ctx = ToolContext(
+        ctx_tool = ToolContext(
             dry_run=self.dry_run,
             agent_base_url=self.agent_base_url,
             workspace_root=self.workspace_root,
@@ -159,23 +219,45 @@ class JarvisRuntime:
         if use_task_memory and task_memory is None:
             task_memory = TaskMemory()
 
+        # --- EXECUTING ---
         executor = Executor(
             registry=self.registry,
-            ctx=ctx,
+            ctx=ctx_tool,
             state=state,
             task_memory=task_memory,
             on_step_update=on_step_update,
+            request_context=ctx if isinstance(ctx, RequestContext) else None,
+            event_bus=self.event_bus,
         )
         results = executor.run_plan(steps)
+
+        # --- VERIFYING ---
+        if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
+            if not ("paused_step_index" in state.data or state.data.get("user_help_required")):
+                try:
+                    ctx.transition_to(RequestStatus.VERIFYING, event_bus=self.event_bus)
+                except Exception:
+                    pass
+
         ok, summary, pending_confirmation = self._summarize_execution(results, state, len(steps))
 
+        # --- COMPLETING / FAILING / WAITING ---
         if pending_confirmation:
             confirmation_message = state.data.get("user_help_required", "Akce vyzaduje potvrzeni.")
             summary = confirmation_message
+            if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
+                try:
+                    ctx.transition_to(
+                        RequestStatus.WAITING_FOR_USER,
+                        event_bus=self.event_bus,
+                        message=confirmation_message,
+                    )
+                except Exception:
+                    pass
         elif ok:
-            complete_current_request()
+            complete_current_request(result=summary, event_bus=self.event_bus)
         else:
-            fail_current_request()
+            fail_current_request(error=summary, event_bus=self.event_bus)
 
         result = RuntimeResult(
             ok=ok,
@@ -205,6 +287,13 @@ class JarvisRuntime:
         on_step_update: Optional[StepCallback] = None,
         on_task_start: Optional[TaskStartCallback] = None,
     ) -> RuntimeResult:
+        ctx = get_current_request()
+        if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
+            try:
+                ctx.transition_to(RequestStatus.EXECUTING, event_bus=self.event_bus, start_index=start_index)
+            except Exception:
+                pass
+
         state.data["action_confirmed"] = True
         state.data.pop("user_help_required", None)
         state.data.pop("paused_step_index", None)
@@ -215,18 +304,44 @@ class JarvisRuntime:
                 goal,
                 [step.get("description") or f"Spustit tool {step.get('tool')}" for step in remaining_steps],
             )
-        ctx = ToolContext(
+        ctx_tool = ToolContext(
             dry_run=self.dry_run,
             agent_base_url=self.agent_base_url,
             workspace_root=self.workspace_root,
         )
-        executor = Executor(self.registry, ctx, state, task_memory, on_step_update)
+        executor = Executor(
+            registry=self.registry,
+            ctx=ctx_tool,
+            state=state,
+            task_memory=task_memory,
+            on_step_update=on_step_update,
+            request_context=ctx if isinstance(ctx, RequestContext) else None,
+            event_bus=self.event_bus,
+        )
         results = executor.run_plan(remaining_steps)
+
+        if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
+            if not ("paused_step_index" in state.data or state.data.get("user_help_required")):
+                try:
+                    ctx.transition_to(RequestStatus.VERIFYING, event_bus=self.event_bus)
+                except Exception:
+                    pass
+
         ok, summary, pending_confirmation = self._summarize_execution(results, state, len(steps), start_index)
         if ok:
-            complete_current_request()
+            complete_current_request(result=summary, event_bus=self.event_bus)
         elif not pending_confirmation:
-            fail_current_request()
+            fail_current_request(error=summary, event_bus=self.event_bus)
+        else:
+            if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
+                try:
+                    ctx.transition_to(
+                        RequestStatus.WAITING_FOR_USER,
+                        event_bus=self.event_bus,
+                        message=state.data.get("user_help_required", summary),
+                    )
+                except Exception:
+                    pass
 
         return RuntimeResult(
             ok=ok,
@@ -237,7 +352,7 @@ class JarvisRuntime:
             results=results,
             state=state,
             summary=summary if not pending_confirmation else state.data.get("user_help_required", summary),
-            request_id=get_current_request().request_id,
+            request_id=getattr(ctx, "request_id", ""),
             pending_confirmation=pending_confirmation,
             confirmation_message=state.data.get("user_help_required", ""),
         )
