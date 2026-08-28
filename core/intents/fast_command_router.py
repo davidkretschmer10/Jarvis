@@ -268,9 +268,9 @@ def get_fast_command_step(goal: str) -> Optional[Tuple[Dict[str, Any], float, Op
         if kw in norm:
             return None
 
-    if norm in ("screenshot", "udelej screenshot"):
+    if norm in ("screenshot", "udelej screenshot", "snimek obrazovky"):
         return {"tool": "screenshot", "input": {}, "description": "Pořídit snímek obrazovky"}, 1.0, None
-    if norm in ("precti obrazovku", "cti obrazovku"):
+    if norm in ("precti obrazovku", "cti obrazovku", "ocr"):
         return {"tool": "read_screen", "input": {}, "description": "Přečíst obrazovku pomocí OCR"}, 1.0, None
     if norm in ("zavri okno", "zavri aktivni okno"):
         return {"tool": "close_window", "input": {}, "description": "Zavřít aktivní okno"}, 1.0, None
@@ -278,10 +278,26 @@ def get_fast_command_step(goal: str) -> Optional[Tuple[Dict[str, Any], float, Op
         return {"tool": "press_key", "input": {"key": "enter"}, "description": "Stisknout klávesu Enter"}, 1.0, None
     if norm == "stiskni escape":
         return {"tool": "press_key", "input": {"key": "escape"}, "description": "Stisknout klávesu Escape"}, 1.0, None
+    if norm in ("prepni", "dalsi", "dalsi skladba"):
+        return {"tool": "press_key", "input": {"key": "nexttrack"}, "description": "Přepnout na další skladbu"}, 1.0, None
+    if norm in ("zastav", "pauzni", "stopni", "pauza", "play", "pause"):
+        return {"tool": "press_key", "input": {"key": "playpause"}, "description": "Pozastavit / Spustit přehrávání"}, 1.0, None
+    if norm in ("predchozi", "vrat", "predchozi skladba"):
+        return {"tool": "press_key", "input": {"key": "prevtrack"}, "description": "Vrátit na předchozí skladbu"}, 1.0, None
     if norm in ("vypis slozku", "zobraz soubory"):
         return {"tool": "list_dir", "input": {"path": "."}, "description": "Vypsat obsah složky"}, 1.0, None
     if norm in ("refresh_apps", "refresh apps"):
         return {"tool": "refresh_apps", "input": {}, "description": "Znovu načíst cache aplikací a aktualizovat seznam"}, 1.0, None
+
+    key_prefixes = ("stiskni ", "zmackni ")
+    for prefix in key_prefixes:
+        if norm.startswith(prefix):
+            val = norm[len(prefix):].strip()
+            if "+" in val or " " in val:
+                keys = [p for p in val.replace("+", " ").split() if p]
+                return {"tool": "hotkey", "input": {"keys": keys}, "description": f"Stisknout klávesovou zkratku {'+'.join(keys)}"}, 1.0, None
+            return {"tool": "press_key", "input": {"key": val}, "description": f"Stisknout klávesu {val}"}, 1.0, None
+
 
     search_prefixes = ("vyhledej ", "najdi ", "search ")
     for prefix in search_prefixes:

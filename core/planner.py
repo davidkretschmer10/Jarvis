@@ -109,3 +109,37 @@ Cil:
             break
             
         return steps
+
+    def replan(self, goal: str, failed_step: JSON, error_msg: str, current_state: Any = None) -> List[JSON]:
+        """Generates a new plan for the remaining goal after a step failure."""
+        from ai.engine import ask_ai
+
+        state_info = ""
+        if current_state and hasattr(current_state, "snapshot"):
+            state_info = f"\nAktuální stav paměti: {current_state.snapshot()}"
+
+        replan_prompt = f"""
+Jsi autonomní agent Jarvis. Původní plán pro dosáhnutí cíle selhal.
+Tvoř nový plán pro dokončení zbývající části cíle z aktuálního stavu.
+
+Původní cíl: {goal}
+Selhaný krok: {failed_step}
+Chybová zpráva: "{error_msg}"
+{state_info}
+
+Dostupné nástroje:
+{self.registry.describe_for_planner()}
+
+Požadavky:
+- Vrať POUZE platné JSON pole nových kroků pro dokončení cíle.
+- Pokud cíl nelze splnit, vrať prázdné pole [].
+- Nepoužívej stejný chybný nástroj se stejným vstupem bez úpravy.
+"""
+        raw = ask_ai(replan_prompt)
+        arr = extract_first_json_array(raw) or []
+        new_steps: List[JSON] = []
+        for item in arr:
+            if isinstance(item, dict) and "tool" in item:
+                new_steps.append(item)
+        return new_steps
+

@@ -280,11 +280,13 @@ def command():
     else:
         result = "ERROR: Neznamy prikaz"
 
+
     if isinstance(result, dict) and "ok" in result:
         return jsonify(result)
 
     ok = not str(result).lower().startswith(("error", "failed"))
     return jsonify({"ok": ok, "result": result})
+
 
 
 if __name__ == "__main__":

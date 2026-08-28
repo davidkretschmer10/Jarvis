@@ -219,6 +219,8 @@ class JarvisRuntime:
         if use_task_memory and task_memory is None:
             task_memory = TaskMemory()
 
+        planner_inst = Planner(registry=self.registry)
+
         # --- EXECUTING ---
         executor = Executor(
             registry=self.registry,
@@ -228,8 +230,10 @@ class JarvisRuntime:
             on_step_update=on_step_update,
             request_context=ctx if isinstance(ctx, RequestContext) else None,
             event_bus=self.event_bus,
+            planner=planner_inst,
         )
         results = executor.run_plan(steps)
+
 
         # --- VERIFYING ---
         if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
@@ -309,6 +313,7 @@ class JarvisRuntime:
             agent_base_url=self.agent_base_url,
             workspace_root=self.workspace_root,
         )
+        planner_inst = Planner(registry=self.registry)
         executor = Executor(
             registry=self.registry,
             ctx=ctx_tool,
@@ -317,8 +322,10 @@ class JarvisRuntime:
             on_step_update=on_step_update,
             request_context=ctx if isinstance(ctx, RequestContext) else None,
             event_bus=self.event_bus,
+            planner=planner_inst,
         )
         results = executor.run_plan(remaining_steps)
+
 
         if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
             if not ("paused_step_index" in state.data or state.data.get("user_help_required")):

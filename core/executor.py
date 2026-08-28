@@ -25,6 +25,12 @@ class Executor:
     on_step_update: Callable[[int, str], None] | None = None
     request_context: RequestContext | None = None
     event_bus: Any = None
+    planner: Any = None
+    max_steps: int = 15
+    max_retries: int = 0
+    max_repairs: int = 1
+    max_replans: int = 2
+
 
     def run_plan(self, steps: List[JSON]) -> List[JSON]:
         results: List[JSON] = []
@@ -34,16 +40,29 @@ class Executor:
 
         # If task memory is available, initialize/start task track
         if self.task_memory:
-            # Convert planner steps format to task memory steps
             self.task_memory.start_task(self.state.last_output or "Spuštění úkolu", steps)
 
-        for i, step in enumerate(steps):
-            if self.request_context and (self.request_context.cancellation_requested or self.request_context.status == RequestStatus.CANCELLED):
-                print(f"[EXECUTOR] Execution cancelled at step {i+1}")
+        current_steps = list(steps)
+        step_idx = 0
+        total_executed_steps = 0
+        replans_count = 0
+
+        while step_idx < len(current_steps):
+            if total_executed_steps >= self.max_steps:
+                err_msg = f"Překročen maximální počet kroků ({self.max_steps})."
+                print(f"[EXECUTOR] {err_msg}")
+                if self.request_context and not self.request_context.is_terminal:
+                    self.request_context.transition_to(RequestStatus.FAILED, error=err_msg, event_bus=self.event_bus)
+                self.state.data["user_help_required"] = err_msg
                 break
 
+            if self.request_context and (self.request_context.cancellation_requested or self.request_context.status == RequestStatus.CANCELLED):
+                print(f"[EXECUTOR] Execution cancelled at step {step_idx+1}")
+                break
+
+            step = current_steps[step_idx]
             if self.request_context:
-                self.request_context.current_step = i + 1
+                self.request_context.current_step = step_idx + 1
 
             tool_name = str(step.get("tool", "")).strip()
             tool_input = step.get("input", {})
@@ -52,49 +71,59 @@ class Executor:
 
             # Update status to in_progress
             if self.task_memory:
-                self.task_memory.update_step_status(i, "in_progress")
+                self.task_memory.update_step_status(step_idx, "in_progress")
             if self.on_step_update:
-                self.on_step_update(i, "in_progress")
+                self.on_step_update(step_idx, "in_progress")
             if self.event_bus:
                 self.event_bus.emit(
                     "step_started",
                     {
                         "request_id": self.request_context.request_id if self.request_context else "",
-                        "step_index": i + 1,
+                        "step_index": step_idx + 1,
                         "tool": tool_name,
                         "description": step.get("description", ""),
                     },
                 )
 
-            # Allow the plan to reference previous outputs using templates
+            # Render input templates
             tool_input = render_templates(tool_input, self.state)
+            total_executed_steps += 1
 
-            out = self.registry.run(tool_name, tool_input, self.ctx, self.state)
+            # 1. Execute tool with retry for transient errors
+            out = None
+            for attempt in range(1 + self.max_retries):
+                out = self.registry.run(tool_name, tool_input, self.ctx, self.state)
+                if out.get("ok", False):
+                    break
+                err = str(out.get("error", ""))
+                if "CONFIRMATION_REQUIRED" in err or "VisionError" in err:
+                    break
+                if attempt < self.max_retries:
+                    print(f"[EXECUTOR] Step {step_idx+1} tool '{tool_name}' failed attempt {attempt+1}. Retrying...")
 
-            # Check for failure and try to repair
+            # 2. Check execution outcome
             if not out.get("ok", False):
                 error_msg = str(out.get("error", "Neznámá chyba"))
 
-                # Check for VisionError
+                # VisionError handling
                 if "VisionError" in error_msg:
                     import logging
-
                     logging.getLogger(__name__).error("Vision error during execution: %s", error_msg)
                     czech_msg = "Vision systém není dostupný. Zkontrolujte instalaci OCR."
                     if self.task_memory:
-                        self.task_memory.update_step_status(i, "failed", czech_msg)
+                        self.task_memory.update_step_status(step_idx, "failed", czech_msg)
                     if self.on_step_update:
-                        self.on_step_update(i, "failed")
+                        self.on_step_update(step_idx, "failed")
                     if self.request_context and not self.request_context.is_terminal:
                         self.request_context.transition_to(RequestStatus.FAILED, error=czech_msg, event_bus=self.event_bus)
                     self.state.data["user_help_required"] = czech_msg
 
                     self._update_state_after_step(
-                        i, tool_name, tool_input, {"ok": False, "error": "VisionError", "result": czech_msg}
+                        step_idx, tool_name, tool_input, {"ok": False, "error": "VisionError", "result": czech_msg}
                     )
                     results.append(
                         {
-                            "step": i + 1,
+                            "step": step_idx + 1,
                             "tool": tool_name,
                             "input": tool_input,
                             "output": {"ok": False, "error": "VisionError", "result": czech_msg},
@@ -106,7 +135,7 @@ class Executor:
                             "step_completed",
                             {
                                 "request_id": self.request_context.request_id if self.request_context else "",
-                                "step_index": i + 1,
+                                "step_index": step_idx + 1,
                                 "tool": tool_name,
                                 "ok": False,
                                 "error": czech_msg,
@@ -114,25 +143,25 @@ class Executor:
                         )
                     break
 
-                # Check for CONFIRMATION_REQUIRED
+                # CONFIRMATION_REQUIRED handling
                 if error_msg == "CONFIRMATION_REQUIRED":
                     if self.task_memory:
-                        self.task_memory.update_step_status(i, "paused")
+                        self.task_memory.update_step_status(step_idx, "paused")
                     if self.on_step_update:
-                        self.on_step_update(i, "paused")
+                        self.on_step_update(step_idx, "paused")
                     if self.request_context and not self.request_context.is_terminal:
                         self.request_context.transition_to(
                             RequestStatus.WAITING_FOR_USER,
                             event_bus=self.event_bus,
                             message=out.get("message", "Akce vyžaduje potvrzení."),
                         )
-                    self.state.data["paused_step_index"] = i
+                    self.state.data["paused_step_index"] = step_idx
                     self.state.data["user_help_required"] = out.get("message", "Akce vyžaduje potvrzení.")
 
-                    self._update_state_after_step(i, tool_name, tool_input, out)
+                    self._update_state_after_step(step_idx, tool_name, tool_input, out)
                     results.append(
                         {
-                            "step": i + 1,
+                            "step": step_idx + 1,
                             "tool": tool_name,
                             "input": tool_input,
                             "output": out,
@@ -144,7 +173,7 @@ class Executor:
                             "step_completed",
                             {
                                 "request_id": self.request_context.request_id if self.request_context else "",
-                                "step_index": i + 1,
+                                "step_index": step_idx + 1,
                                 "tool": tool_name,
                                 "ok": False,
                                 "status": "paused",
@@ -152,7 +181,7 @@ class Executor:
                         )
                     break
 
-                # Try auto-repair
+                # 3. Auto-repair
                 repaired = self._attempt_repair(step, error_msg)
                 if repaired:
                     out = {
@@ -160,23 +189,39 @@ class Executor:
                         "result": f"Krok selhal s chybou '{error_msg}', ale byl úspěšně opraven automatickou akcí.",
                     }
                     if self.task_memory:
-                        self.task_memory.update_step_status(i, "completed", str(out.get("result", "")))
+                        self.task_memory.update_step_status(step_idx, "completed", str(out.get("result", "")))
                     if self.on_step_update:
-                        self.on_step_update(i, "completed")
+                        self.on_step_update(step_idx, "completed")
                 else:
-                    # Mark step as failed
+                    # 4. Replanning fallback if repair failed
+                    if replans_count < self.max_replans and self.planner and hasattr(self.planner, "replan"):
+                        print(f"[EXECUTOR] Attempting replan ({replans_count + 1}/{self.max_replans})...")
+                        goal_str = getattr(self.request_context, "goal", "") or self.state.last_output
+                        new_sub_steps = self.planner.replan(goal_str, step, error_msg, self.state)
+                        if new_sub_steps:
+                            replans_count += 1
+                            print(f"[EXECUTOR] Replan produced {len(new_sub_steps)} new steps.")
+                            current_steps = current_steps[:step_idx] + new_sub_steps
+                            if self.request_context:
+                                self.request_context.total_steps = len(current_steps)
+                            if self.task_memory:
+                                self.task_memory.start_task(goal_str, current_steps)
+                            if self.event_bus:
+                                self.event_bus.emit("replanning_completed", {"new_steps": new_sub_steps, "replans_count": replans_count})
+                            continue
+
+                    # Mark step as failed if repair and replan failed
                     if self.task_memory:
-                        self.task_memory.update_step_status(i, "failed", error_msg)
+                        self.task_memory.update_step_status(step_idx, "failed", error_msg)
                     if self.on_step_update:
-                        self.on_step_update(i, "failed")
+                        self.on_step_update(step_idx, "failed")
                     if self.request_context and not self.request_context.is_terminal:
                         self.request_context.transition_to(RequestStatus.FAILED, error=error_msg, event_bus=self.event_bus)
 
-                    # Store step results and break
-                    self._update_state_after_step(i, tool_name, tool_input, out)
+                    self._update_state_after_step(step_idx, tool_name, tool_input, out)
                     results.append(
                         {
-                            "step": i + 1,
+                            "step": step_idx + 1,
                             "tool": tool_name,
                             "input": tool_input,
                             "output": out,
@@ -188,7 +233,7 @@ class Executor:
                             "step_completed",
                             {
                                 "request_id": self.request_context.request_id if self.request_context else "",
-                                "step_index": i + 1,
+                                "step_index": step_idx + 1,
                                 "tool": tool_name,
                                 "ok": False,
                                 "error": error_msg,
@@ -198,19 +243,19 @@ class Executor:
             else:
                 # Update status to completed
                 if self.task_memory:
-                    self.task_memory.update_step_status(i, "completed", str(out.get("result", "")))
+                    self.task_memory.update_step_status(step_idx, "completed", str(out.get("result", "")))
                 if self.on_step_update:
-                    self.on_step_update(i, "completed")
+                    self.on_step_update(step_idx, "completed")
 
             # State updates
-            self._update_state_after_step(i, tool_name, tool_input, out)
+            self._update_state_after_step(step_idx, tool_name, tool_input, out)
 
             if self.event_bus:
                 self.event_bus.emit(
                     "step_completed",
                     {
                         "request_id": self.request_context.request_id if self.request_context else "",
-                        "step_index": i + 1,
+                        "step_index": step_idx + 1,
                         "tool": tool_name,
                         "ok": True,
                         "result": out.get("result", ""),
@@ -218,20 +263,22 @@ class Executor:
                 )
 
             # Debug logging
-            print(f"[STEP {i+1}] tool={tool_name}")
+            print(f"[STEP {step_idx+1}] tool={tool_name}")
             print("[TOOL OUTPUT]", out)
             print("[STATE]", self.state.snapshot())
 
             results.append(
                 {
-                    "step": i + 1,
+                    "step": step_idx + 1,
                     "tool": tool_name,
                     "input": tool_input,
                     "output": out,
                     "state": self.state.snapshot(),
                 }
             )
+            step_idx += 1
         return results
+
 
     def _update_state_after_step(self, i: int, tool_name: str, tool_input: JSON, out: JSON) -> None:
         self.state.last_output = out.get("result") if isinstance(out.get("result"), str) else str(out)
