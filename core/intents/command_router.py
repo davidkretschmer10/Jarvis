@@ -179,76 +179,20 @@ def execute_vision() -> str:
 
 def route_and_execute_command(parsed: ParsedCommand) -> str:
     """
-    Routes the parsed command to the correct tool or falls back to LLM.
-    Returns the string response to show in the GUI.
+    Routes the parsed command through the unified JarvisRuntime pipeline.
+    Preserved as a thin compatibility wrapper for legacy callers.
     """
-    intent = parsed.intent
-    target = parsed.target
-    original_text = parsed.original_text
-    
-    print(f"\n[INTENT]\nDetected: {intent.value}")
-    if target:
-        print(f"[TARGET]\n{target}")
-    
-    if intent == IntentType.OPEN_APP:
-        print("[TOOL]\nLaunching application...")
-        if not target:
-            return "Omlouvám se, ale neuvedl jsi název aplikace, kterou chceš otevřít."
-            
-        res_str = send_agent_command("open", target)
-        
-        is_ok = True
-        result_text = res_str
-        try:
-            res_json = json.loads(res_str)
-            if isinstance(res_json, dict):
-                is_ok = res_json.get("ok", True)
-                result_text = res_json.get("result", res_str)
-        except Exception:
-            pass
-            
-        if not is_ok or "error" in str(result_text).lower() or "failed" in str(result_text).lower():
-            return f"Nepodařilo se najít aplikaci „{target}“."
-            
-        mapping = {
-            "epic": "Epic Games Launcher",
-            "chrome": "Google Chrome",
-            "discord": "Discord",
-            "steam": "Steam",
-            "blender": "Blender",
-            "vscode": "Visual Studio Code"
-        }
-        app_name = mapping.get(target.lower(), target.capitalize())
-        return f"{app_name} je otevřený."
-        
-    elif intent == IntentType.SEARCH_WEB:
-        print("[TOOL]\nOpening browser search...")
-        if not target:
-            return "Omlouvám se, ale neuvedl jsi, co mám vyhledat."
-            
-        url = build_search_url(target, original_text)
-        send_agent_command("website", url)
-        
-        target_lower = target.lower().strip()
-        orig_lower = original_text.lower().strip()
-        if "youtube" in orig_lower:
-            return "Otevírám YouTube v prohlížeči."
-        elif "chatgpt" in orig_lower:
-            return "Otevírám ChatGPT v prohlížeči."
-        elif "wikipedia" in orig_lower or "wikipedie" in orig_lower or "wikipedii" in orig_lower:
-            return f"Vyhledávám „{target}“ na Wikipedii v prohlížeči."
-        return f"Vyhledávám „{target}“ v prohlížeči."
-        
-    elif intent == IntentType.CONTROL_PC:
-        print("[TOOL]\nExecuting PC control action...")
-        return execute_control_pc(original_text, target)
-        
-    elif intent == IntentType.VISION:
-        print("[TOOL]\nReading screen OCR...")
-        return execute_vision()
-        
-    elif intent in (IntentType.CREATE_FILE, IntentType.CREATE_PRESENTATION):
-        parsed.requires_llm = True
-        return ""
-        
-    return ""
+    from core.runtime import JarvisRuntime
+
+    goal = parsed.original_text if parsed and getattr(parsed, "original_text", None) else ""
+    if not goal and parsed and getattr(parsed, "intent", None):
+        target = getattr(parsed, "target", "")
+        goal = f"{parsed.intent.value} {target}".strip()
+
+    if not goal:
+        return "Omlouvám se, ale neuvedl jsi cíl příkazu."
+
+    runtime = JarvisRuntime()
+    result = runtime.run_task(goal)
+    return result.summary
+

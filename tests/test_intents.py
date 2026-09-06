@@ -48,21 +48,25 @@ class IntentsTests(unittest.TestCase):
         self.assertEqual(build_search_url("wikipedia praha", "wikipedia praha"), "https://cs.wikipedia.org/w/index.php?search=praha")
         self.assertEqual(build_search_url("nejlepsi procesory"), "https://www.google.com/search?q=nejlepsi%20procesory")
 
-    @patch("core.intents.command_router.send_agent_command")
-    def test_routing_responses(self, mock_send):
-        mock_send.return_value = '{"ok": true, "result": "SUCCESS"}'
+    @patch("core.runtime.JarvisRuntime.run_task")
+    def test_routing_responses(self, mock_run_task):
+        mock_result = unittest.mock.MagicMock()
+        mock_result.summary = "Epic Games Launcher je otevřený."
+        mock_run_task.return_value = mock_result
         
         # Test open app response formatting
         parsed = classify_intent("zapni epic")
         res = route_and_execute_command(parsed)
-        self.assertEqual(res, "Epic Games Launcher je otev\u0159en\u00fd.")
-        mock_send.assert_called_with("open", "epic")
+        self.assertEqual(res, "Epic Games Launcher je otevřený.")
+        mock_run_task.assert_called_with("zapni epic")
 
         # Test search web response formatting
+        mock_result.summary = "Otevírám YouTube v prohlížeči."
         parsed = classify_intent("najdi youtube")
         res = route_and_execute_command(parsed)
-        self.assertEqual(res, "Otev\u00edr\u00e1m YouTube v prohl\u00ed\u017ee\u010di.")
-        mock_send.assert_called_with("website", "https://www.youtube.com/")
+        self.assertEqual(res, "Otevírám YouTube v prohlížeči.")
+        mock_run_task.assert_called_with("najdi youtube")
+
 
 
 if __name__ == "__main__":

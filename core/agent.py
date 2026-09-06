@@ -226,6 +226,17 @@ def read_screen(value=None):
     return {"text": text}
 
 
+@app.route("/task", methods=["POST"])
+def run_task_endpoint():
+    data = request.get_json(silent=True) or {}
+    goal = str(data.get("goal") or data.get("value") or "").strip()
+    if not goal:
+        return jsonify({"ok": False, "error": "Chybi cil ukolu."})
+    from core.runtime import JarvisRuntime
+    res = JarvisRuntime().run_task(goal)
+    return jsonify({"ok": res.ok, "result": res.summary, "steps": res.steps, "route": res.route})
+
+
 @app.route("/command", methods=["POST"])
 def command():
     data = request.get_json(silent=True) or {}
@@ -238,6 +249,11 @@ def command():
         "open_website": "website",
     }
     action = aliases.get(action, action)
+
+    if action == "task":
+        from core.runtime import JarvisRuntime
+        res = JarvisRuntime().run_task(str(value))
+        return jsonify({"ok": res.ok, "result": res.summary, "steps": res.steps, "route": res.route})
 
     if action == "refresh_apps":
         load_scanned_apps(force=True)
@@ -279,6 +295,7 @@ def command():
         result = read_screen(value)
     else:
         result = "ERROR: Neznamy prikaz"
+
 
 
     if isinstance(result, dict) and "ok" in result:
