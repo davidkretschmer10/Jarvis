@@ -6,27 +6,18 @@ import time
 
 class AutonomousAgent:
     def __init__(self):
-        import os
-        import json
+        from core.memory_manager import get_memory_manager
 
         self.memory = []
         self.max_steps = 10
-        self.app_memory_file = "app_memory.json"
-        self.app_memory = {}
-
-        if os.path.exists(self.app_memory_file):
-            try:
-                with open(self.app_memory_file, "r", encoding="utf-8") as f:
-                    self.app_memory = json.load(f)
-            except Exception:
-                pass
+        self.memory_manager = get_memory_manager()
+        self.app_memory = self.memory_manager.load_app_preferences().get("autonomous_agent_memory", {})
 
     def save_memory(self):
-        import json
-
         try:
-            with open(self.app_memory_file, "w", encoding="utf-8") as f:
-                json.dump(self.app_memory, f, indent=4, ensure_ascii=False)
+            prefs = self.memory_manager.load_app_preferences()
+            prefs["autonomous_agent_memory"] = self.app_memory
+            self.memory_manager.save_app_preferences(prefs)
         except Exception as e:
             print("Error saving memory:", e)
 
