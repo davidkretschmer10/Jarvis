@@ -110,7 +110,16 @@ Cil:
             
         return steps
 
-    def replan(self, goal: str, failed_step: JSON, error_msg: str, current_state: Any = None) -> List[JSON]:
+    def replan(
+        self,
+        goal: str,
+        failed_step: JSON,
+        error_msg: str,
+        current_state: Any = None,
+        observation: Any = None,
+        verification_result: Any = None,
+        budget_info: Optional[Dict[str, Any]] = None,
+    ) -> List[JSON]:
         """Generates a new plan for the remaining goal after a step failure."""
         from ai.engine import ask_ai
 
@@ -118,13 +127,41 @@ Cil:
         if current_state and hasattr(current_state, "snapshot"):
             state_info = f"\nAktuální stav paměti: {current_state.snapshot()}"
 
+        structured_details = []
+        if verification_result is not None:
+            v_dict = verification_result.to_dict() if hasattr(verification_result, "to_dict") else verification_result
+            if isinstance(v_dict, dict):
+                structured_details.append(f"Status ověření (Verification): {v_dict.get('status', 'FAILED')}")
+                if v_dict.get("expected"):
+                    structured_details.append(f"Očekáváno (Expected): {v_dict.get('expected')}")
+                if v_dict.get("observed"):
+                    structured_details.append(f"Pozorováno (Observed): {v_dict.get('observed')}")
+                if v_dict.get("evidence"):
+                    structured_details.append(f"Důkaz (Evidence): {v_dict.get('evidence')}")
+
+        if observation is not None:
+            o_dict = observation.to_dict() if hasattr(observation, "to_dict") else observation
+            if isinstance(o_dict, dict):
+                structured_details.append(f"Pozorování (Observation source/type): {o_dict.get('source')}/{o_dict.get('type')}")
+                if o_dict.get("data"):
+                    structured_details.append(f"Pozorovaná data: {o_dict.get('data')}")
+
+        if budget_info:
+            b_str = ", ".join(f"{k}={v}" for k, v in budget_info.items())
+            structured_details.append(f"Zbývající rozpočet (Remaining budget): {b_str}")
+
+        details_block = ""
+        if structured_details:
+            details_block = "\nPodrobnosti o selhání kroku a ověření:\n" + "\n".join(f"- {d}" for d in structured_details)
+
         replan_prompt = f"""
-Jsi autonomní agent Jarvis. Původní plán pro dosáhnutí cíle selhal.
+Jsi autonomní agent Jarvis. Původní plán pro dosáhnutí cíle selhal při provádění nebo ověření výsledku.
 Tvoř nový plán pro dokončení zbývající části cíle z aktuálního stavu.
 
 Původní cíl: {goal}
 Selhaný krok: {failed_step}
 Chybová zpráva: "{error_msg}"
+{details_block}
 {state_info}
 
 Dostupné nástroje:

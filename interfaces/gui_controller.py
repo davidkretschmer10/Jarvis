@@ -62,6 +62,11 @@ class GuiController(QObject):
         self.event_bus.on("user_message", self.handle_user_message)
         self.event_bus.on("ai_request", self.process_ai_request)
         self.event_bus.on("agent_request", self.process_agent_request)
+        self.event_bus.on("verification_started", self._on_verification_started)
+        self.event_bus.on("verification_completed", self._on_verification_completed)
+        self.event_bus.on("verification_failed", self._on_verification_failed)
+        self.event_bus.on("step_repair", self._on_step_repair)
+        self.event_bus.on("replanning_started", self._on_replanning_started)
         self.chats = load_json(CHATS_FILE)
 
         for chat in self.chats:
@@ -99,6 +104,25 @@ class GuiController(QObject):
 
     def emit_vision_status(self):
         self.vision_status_changed.emit(self.tesseract_msg)
+
+    def _on_verification_started(self, data):
+        self.status_changed.emit("Ověřuji...")
+
+    def _on_verification_completed(self, data):
+        st = data.get("status", "")
+        if st == "VERIFIED":
+            self.status_changed.emit("Ověřeno")
+        elif st == "UNKNOWN":
+            self.status_changed.emit("Provádím...")
+
+    def _on_verification_failed(self, data):
+        self.status_changed.emit("Ověření selhalo")
+
+    def _on_step_repair(self, data):
+        self.status_changed.emit("Opravuji...")
+
+    def _on_replanning_started(self, data):
+        self.status_changed.emit("Přeplánovávám...")
 
     def refresh_ollama_status(self):
         def status_task():

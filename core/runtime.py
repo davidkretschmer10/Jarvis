@@ -482,25 +482,32 @@ class JarvisRuntime:
         if total_steps > 0 and not results:
             return False, "Nebyly provedeny zadne kroky.", False
 
-        # 4. Check if any executed step failed / cancelled / timed out
+        # 4. Check if any executed step failed / cancelled / timed out or verification failed
+        has_unknown = False
         for idx, res in enumerate(results):
             out = res.get("output", {})
             status = res.get("status")
+            v_status = res.get("verification_status")
+
             if status in ("CANCELLED", StepExecutionStatus.CANCELLED.value):
                 return False, f"Ukol byl zrusen na kroku {start_index + idx + 1}.", False
             if status in ("TIMEOUT", StepExecutionStatus.TIMEOUT.value):
                 return False, f"Ukol vyprsel (timeout) na kroku {start_index + idx + 1}.", False
-            if not out.get("ok", False):
+            if v_status == "FAILED" or status in ("FAILED", StepExecutionStatus.FAILED.value) or not out.get("ok", False):
                 step_no = start_index + idx + 1
-                error = out.get("error", "Neznama chyba")
+                error = out.get("error", "Overeni vysledku akce selhalo")
                 return False, f"Ukol selhal na kroku {step_no}: {error}", False
+            if v_status == "UNKNOWN":
+                has_unknown = True
 
         # 5. Check completed count vs total planned steps
         executed_count = len(results)
         if total_steps > 0 and (start_index + executed_count) < total_steps:
             return False, f"Ukol nebyl dokoncen: provedeno {start_index + executed_count} z {total_steps} kroku.", False
 
-        return True, f"Ukol byl uspesne dokoncen! Celkem provedeno {total_steps} kroku.", False
+        if has_unknown:
+            return True, f"Ukol byl uspesne proveden (stav nekterych kroku zustal UNKNOWN). Celkem provedeno {total_steps} kroku.", False
+        return True, f"Ukol byl uspesne dokoncen a overen! Celkem provedeno {total_steps} kroku.", False
 
     def _emit(self, event_name: str, data: Any) -> None:
         if self.event_bus is not None:

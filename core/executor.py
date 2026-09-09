@@ -14,6 +14,8 @@ from core.lifecycle import RequestContext, RequestStatus
 from core.state import JarvisState
 from core.template import render_templates
 from core.task_memory import TaskMemory
+from core.verification import StepVerifierRegistry, VerificationStatus, VerificationResult
+from core.observation import Observation, ObservationType
 
 logger = logging.getLogger(__name__)
 
@@ -76,7 +78,11 @@ class StepResult(dict):
 
     @property
     def is_success(self) -> bool:
-        return self.status == StepExecutionStatus.SUCCESS and bool(self.output.get("ok", False))
+        return (
+            self.status == StepExecutionStatus.SUCCESS
+            and bool(self.output.get("ok", False))
+            and self.verification_status != "FAILED"
+        )
 
 
 @dataclass
@@ -89,6 +95,7 @@ class Executor:
     request_context: RequestContext | None = None
     event_bus: Any = None
     planner: Any = None
+    verifier: Any = None
     max_steps: int = 15
     max_retries: int = 0
     max_repairs: int = 1
@@ -248,7 +255,148 @@ class Executor:
 
             out = out or {"ok": False, "error": "No output produced"}
 
-            # 4. Check execution outcome
+            # 4. Observe & Verify (if tool execution succeeded)
+            verification_status = "unverified"
+            verification_evidence = None
+            verification_result_obj = None
+            step_observation = None
+
+            if out.get("ok", False):
+                if self._is_cancelled():
+                    cancelled_during_run = True
+                else:
+                    if self.verifier is None:
+                        self.verifier = StepVerifierRegistry()
+
+                    req_id = self.request_context.request_id if self.request_context else ""
+                    if self.event_bus:
+                        self.event_bus.emit(
+                            "verification_started",
+                            {
+                                "request_id": req_id,
+                                "step_index": step_idx + 1,
+                                "tool": tool_name,
+                            },
+                        )
+
+                    v_res: VerificationResult = self.verifier.verify_step(
+                        step, out, state=self.state, ctx=self.request_context
+                    )
+                    verification_result_obj = v_res
+
+                    if self._is_cancelled():
+                        cancelled_during_run = True
+                    else:
+                        if v_res.is_verified():
+                            verification_status = "VERIFIED"
+                            verification_evidence = v_res.evidence
+                            if self.event_bus:
+                                self.event_bus.emit(
+                                    "verification_completed",
+                                    {
+                                        "request_id": req_id,
+                                        "step_index": step_idx + 1,
+                                        "tool": tool_name,
+                                        "status": "VERIFIED",
+                                        "message": v_res.message,
+                                        "evidence": v_res.evidence,
+                                    },
+                                )
+                        elif v_res.is_not_applicable():
+                            verification_status = "NOT_APPLICABLE"
+                            verification_evidence = v_res.evidence
+                            if self.event_bus:
+                                self.event_bus.emit(
+                                    "verification_completed",
+                                    {
+                                        "request_id": req_id,
+                                        "step_index": step_idx + 1,
+                                        "tool": tool_name,
+                                        "status": "NOT_APPLICABLE",
+                                        "message": v_res.message,
+                                    },
+                                )
+                        elif v_res.is_unknown():
+                            # CRITICAL: UNKNOWN must NEVER be converted to VERIFIED
+                            verification_status = "UNKNOWN"
+                            verification_evidence = v_res.evidence
+                            if self.event_bus:
+                                self.event_bus.emit(
+                                    "verification_completed",
+                                    {
+                                        "request_id": req_id,
+                                        "step_index": step_idx + 1,
+                                        "tool": tool_name,
+                                        "status": "UNKNOWN",
+                                        "message": v_res.message,
+                                    },
+                                )
+                        elif v_res.is_failed():
+                            # Verification FAILED! The tool claimed ok=True, but reality check failed!
+                            verification_status = "FAILED"
+                            verification_evidence = v_res.evidence
+                            if self.event_bus:
+                                self.event_bus.emit(
+                                    "verification_failed",
+                                    {
+                                        "request_id": req_id,
+                                        "step_index": step_idx + 1,
+                                        "tool": tool_name,
+                                        "status": "FAILED",
+                                        "expected": v_res.expected,
+                                        "observed": v_res.observed,
+                                        "evidence": v_res.evidence,
+                                        "message": v_res.message,
+                                    },
+                                )
+                            # Step outcome is now FAILED
+                            out = {
+                                "ok": False,
+                                "error": f"Verification failed: {v_res.message or v_res.observed}",
+                                "verification": v_res.to_dict(),
+                            }
+                            step_observation = Observation(
+                                source=v_res.verifier,
+                                type=ObservationType.SYSTEM,
+                                data={"expected": v_res.expected, "observed": v_res.observed},
+                                evidence=v_res.evidence,
+                            )
+
+            # Check if cancelled during verification
+            if cancelled_during_run or self._is_cancelled():
+                print(f"[EXECUTOR] Execution cancelled during/after verification at step {step_idx+1}")
+                if self.task_memory:
+                    self.task_memory.update_step_status(step_idx, "cancelled")
+                if self.on_step_update:
+                    self.on_step_update(step_idx, "cancelled")
+                step_res = StepResult(
+                    step_index=step_idx + 1,
+                    tool=tool_name,
+                    input=tool_input,
+                    output=out or {"ok": False, "error": "Cancelled"},
+                    status=StepExecutionStatus.CANCELLED,
+                    execution_status="cancelled",
+                    verification_status=verification_status,
+                    verification_evidence=verification_evidence,
+                    error="Execution cancelled",
+                    state_snapshot=self.state.snapshot(),
+                )
+                results.append(step_res)
+                if self.event_bus:
+                    self.event_bus.emit(
+                        "step_completed",
+                        {
+                            "request_id": self.request_context.request_id if self.request_context else "",
+                            "step_index": step_idx + 1,
+                            "tool": tool_name,
+                            "ok": False,
+                            "status": "cancelled",
+                            "error": "Request cancelled",
+                        },
+                    )
+                break
+
+            # 5. Check outcome & handle repair/replan if execution or verification failed
             if not out.get("ok", False):
                 error_msg = str(out.get("error", "Neznámá chyba"))
 
@@ -273,6 +421,8 @@ class Executor:
                         output=failed_out,
                         status=StepExecutionStatus.FAILED,
                         execution_status="failed",
+                        verification_status=verification_status,
+                        verification_evidence=verification_evidence,
                         error=czech_msg,
                         state_snapshot=self.state.snapshot(),
                     )
@@ -324,6 +474,8 @@ class Executor:
                         output=out,
                         status=StepExecutionStatus.WAITING_FOR_CONFIRMATION,
                         execution_status="waiting_for_confirmation",
+                        verification_status=verification_status,
+                        verification_evidence=verification_evidence,
                         error="CONFIRMATION_REQUIRED",
                         state_snapshot=self.state.snapshot(),
                     )
@@ -358,6 +510,32 @@ class Executor:
                         )
                     repaired = self._attempt_repair(step, error_msg)
 
+                    # CRITICAL: Re-verify after repair!
+                    if repaired and not self._is_cancelled():
+                        if self.verifier is None:
+                            self.verifier = StepVerifierRegistry()
+                        re_v_res = self.verifier.verify_step(step, out, state=self.state, ctx=self.request_context)
+                        if re_v_res.is_failed():
+                            repaired = False
+                            error_msg = f"Re-verification failed after repair: {re_v_res.message or re_v_res.observed}"
+                            verification_status = "FAILED"
+                            verification_evidence = re_v_res.evidence
+                            verification_result_obj = re_v_res
+                            step_observation = Observation(
+                                source=re_v_res.verifier,
+                                type=ObservationType.SYSTEM,
+                                data={"expected": re_v_res.expected, "observed": re_v_res.observed},
+                                evidence=re_v_res.evidence,
+                            )
+                        elif re_v_res.is_verified():
+                            verification_status = "VERIFIED"
+                            verification_evidence = re_v_res.evidence
+                        elif re_v_res.is_not_applicable():
+                            verification_status = "NOT_APPLICABLE"
+                        elif re_v_res.is_unknown():
+                            verification_status = "UNKNOWN"
+                            verification_evidence = re_v_res.evidence
+
                 if self._is_cancelled():
                     print(f"[EXECUTOR] Execution cancelled after repair attempt at step {step_idx+1}")
                     if self.task_memory:
@@ -371,6 +549,8 @@ class Executor:
                         output={"ok": False, "error": "Cancelled"},
                         status=StepExecutionStatus.CANCELLED,
                         execution_status="cancelled",
+                        verification_status=verification_status,
+                        verification_evidence=verification_evidence,
                         error="Execution cancelled",
                         state_snapshot=self.state.snapshot(),
                     )
@@ -380,7 +560,7 @@ class Executor:
                 if repaired:
                     out = {
                         "ok": True,
-                        "result": f"Krok selhal s chybou '{error_msg}', ale byl úspěšně opraven automatickou akcí.",
+                        "result": f"Krok selhal s chybou '{error_msg}', ale byl úspěšně opraven a ověřen automatickou akcí.",
                     }
                     if self.task_memory:
                         self.task_memory.update_step_status(step_idx, "completed", str(out.get("result", "")))
@@ -405,7 +585,18 @@ class Executor:
                                     "replans_count": replans_count + 1,
                                 },
                             )
-                        new_sub_steps = self.planner.replan(goal_str, step, error_msg, self.state)
+                        new_sub_steps = self.planner.replan(
+                            goal_str,
+                            step,
+                            error_msg,
+                            current_state=self.state,
+                            observation=step_observation,
+                            verification_result=verification_result_obj,
+                            budget_info={
+                                "repairs_remaining": self.max_repairs - repairs_count,
+                                "replans_remaining": self.max_replans - replans_count,
+                            },
+                        )
                         if self._is_cancelled():
                             print(f"[EXECUTOR] Execution cancelled during replan at step {step_idx+1}")
                             break
@@ -441,6 +632,8 @@ class Executor:
                         output=out,
                         status=StepExecutionStatus.FAILED,
                         execution_status="failed",
+                        verification_status=verification_status,
+                        verification_evidence=verification_evidence,
                         error=error_msg,
                         state_snapshot=self.state.snapshot(),
                     )
@@ -481,6 +674,7 @@ class Executor:
                         "tool": tool_name,
                         "ok": True,
                         "result": out.get("result", ""),
+                        "verification_status": verification_status,
                     },
                 )
 
@@ -496,7 +690,8 @@ class Executor:
                 output=out,
                 status=StepExecutionStatus.SUCCESS,
                 execution_status="completed",
-                verification_status="unverified",
+                verification_status=verification_status,
+                verification_evidence=verification_evidence,
                 state_snapshot=self.state.snapshot(),
             )
             results.append(step_res)
