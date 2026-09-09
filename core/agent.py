@@ -234,7 +234,15 @@ def run_task_endpoint():
         return jsonify({"ok": False, "error": "Chybi cil ukolu."})
     from core.runtime import JarvisRuntime
     res = JarvisRuntime().run_task(goal)
-    return jsonify({"ok": res.ok, "result": res.summary, "steps": res.steps, "route": res.route})
+    return jsonify({
+        "ok": res.ok,
+        "result": res.summary,
+        "steps": res.steps,
+        "route": res.route,
+        "request_id": getattr(res, "request_id", ""),
+        "status": getattr(res, "status", ""),
+        "response_text": getattr(res, "response_text", res.summary),
+    })
 
 
 @app.route("/command", methods=["POST"])

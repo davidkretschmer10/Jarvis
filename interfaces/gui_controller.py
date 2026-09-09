@@ -241,7 +241,7 @@ class GuiController(QObject):
                             chosen_candidate = cand
                             break
             
-            if (is_yes or chosen_candidate) and "executor" not in task_info:
+            if is_yes or chosen_candidate:
                 self.paused_task = None
                 if chosen_candidate:
                     state.data["pending_app_path"] = chosen_candidate["path"]
@@ -300,76 +300,6 @@ class GuiController(QObject):
                 threading.Thread(target=resume_task, daemon=True).start()
                 self.clear_input.emit()
                 return
-
-            if is_yes or chosen_candidate:
-                self.paused_task = None
-                if chosen_candidate:
-                    state.data["pending_app_path"] = chosen_candidate["path"]
-                    state.data["pending_app_name"] = chosen_candidate["name"]
-                
-                def resume_task():
-                    self.status_changed.emit("Provádím...")
-                    self.start_ai_bubble.emit()
-                    
-                    state.data["action_confirmed"] = True
-                    steps = task_info["steps"]
-                    start_idx = task_info["step_index"]
-                    
-                    # We execute remaining steps
-                    remaining_steps = steps[start_idx:]
-                    executor = task_info["executor"]
-                    
-                    state.data.pop("user_help_required", None)
-                    state.data.pop("paused_step_index", None)
-                    
-                    try:
-                        results = executor.run_plan(remaining_steps)
-                        if "paused_step_index" in state.data:
-                            # Paused again
-                            self.paused_task = {
-                                "steps": steps,
-                                "state": state,
-                                "step_index": start_idx + state.data["paused_step_index"],
-                                "executor": executor,
-                                "goal": task_info["goal"]
-                            }
-                            prompt_msg = state.data.get("user_help_required", "Akce vyžaduje potvrzení.")
-                            self.chunk_received.emit(prompt_msg)
-                            self.end_ai_bubble.emit()
-                            self.chats[self.current_chat]["messages"].append(f"Jarvis: {prompt_msg}")
-                            save_json(CHATS_FILE, self.chats)
-                            self.status_changed.emit("Ready")
-                            self.event_bus.emit("ai_response", prompt_msg)
-                            return
-                            
-                        help_required = state.data.get("user_help_required")
-                        if help_required:
-                            summary = f"Chyba během provádění: {help_required}"
-                            success = False
-                        else:
-                            if results and not results[-1]["output"].get("ok", False):
-                                summary = f"Úkol selhal na kroku {start_idx + len(results)}: {results[-1]['output'].get('error', 'Neznámá chyba')}"
-                                success = False
-                            else:
-                                summary = f"Úkol byl úspěšně dokončen! Celkem provedeno {len(steps)} kroků."
-                                success = True
-                    except Exception as e:
-                        summary = f"Neočekávaná chyba při provádění úkolu: {e}"
-                        success = False
-
-                    self.chunk_received.emit(summary)
-                    if self.voice_read_enabled:
-                        speak(summary)
-                    self.end_ai_bubble.emit()
-                    self.chats[self.current_chat]["messages"].append(f"Jarvis: {summary}")
-                    save_json(CHATS_FILE, self.chats)
-                    self.status_changed.emit("Ready")
-                    self.task_finished.emit(success, summary)
-                    self.event_bus.emit("ai_response", summary)
-
-                threading.Thread(target=resume_task, daemon=True).start()
-                self.clear_input.emit()
-                return
             else:
                 self.paused_task = None
                 cancel_msg = "Úkol byl zrušen."
@@ -389,27 +319,34 @@ class GuiController(QObject):
             self.process_agent_request(parsed)
             return
 
-        self.event_bus.emit("ai_request", message)
+        self.process_ai_request(message)
 
-    def process_agent_request(self, parsed):
+    def process_request(self, message: str, source: str = "gui", voice_output: bool = False):
         from core.lifecycle import reset_current_request, set_current_request
 
         self.clear_input.emit()
-        goal = parsed.original_text
-        req_ctx = reset_current_request(goal=goal, source="gui_agent")
+        self.profile = update_profile(self.profile, message)
+        save_json(PROFILE_FILE, self.profile)
 
-        def agent_task():
+        req_ctx = reset_current_request(goal=message, source=source)
+
+        def task_worker():
             set_current_request(req_ctx)
-            self.status_changed.emit("Provadim...")
+            self.status_changed.emit("Premyslim...")
+            self.start_ai_bubble.emit()
 
             def update_gui(idx: int, status: str):
                 self.step_updated.emit(idx, status)
 
+            def on_chunk(chunk: str):
+                self.chunk_received.emit(chunk)
+
             try:
                 result = self.runtime.run_task(
-                    goal,
+                    message,
                     on_step_update=update_gui,
                     on_task_start=lambda task_goal, steps: self.task_started.emit(task_goal, steps),
+                    on_chunk=on_chunk,
                     reset_request=False,
                     request_context=req_ctx,
                 )
@@ -424,96 +361,63 @@ class GuiController(QObject):
                 self.event_bus.emit("ai_response", summary)
                 return
 
-            if result.pending_confirmation and result.state.data.get("router_candidates"):
+            reply_text = getattr(result, "response_text", "") or getattr(result, "summary", "")
+
+            if getattr(result, "pending_confirmation", False) and getattr(result, "state", None) and result.state.data.get("router_candidates"):
                 from core.intents.target_extractor import normalize_text
 
                 self.pending_router_choice = {
-                    "query": "prohlizec" if "prohlizec" in normalize_text(goal) else "browser",
+                    "query": "prohlizec" if "prohlizec" in normalize_text(message) else "browser",
                     "candidates": result.state.data.get("router_candidates", []),
-                    "original_text": goal,
+                    "original_text": message,
                 }
-                prompt_msg = result.confirmation_message + "\nKtery chces otevrit?"
+                prompt_msg = getattr(result, "confirmation_message", "") + "\nKtery chces otevrit?"
                 self.chunk_received.emit(prompt_msg)
                 self.end_ai_bubble.emit()
                 self.chats[self.current_chat]["messages"].append(f"Jarvis: {prompt_msg}")
                 save_json(CHATS_FILE, self.chats)
                 self.status_changed.emit("Ready")
                 self.event_bus.emit("ai_response", prompt_msg)
-                if self.voice_read_enabled or (hasattr(self, "voice_active") and self.voice_active):
+                if self.voice_read_enabled or voice_output or (hasattr(self, "voice_active") and self.voice_active):
                     speak(prompt_msg)
                 return
 
-            if result.pending_confirmation:
+            if getattr(result, "pending_confirmation", False):
                 self.paused_task = {
-                    "steps": result.steps,
-                    "state": result.state,
-                    "step_index": result.state.data.get("paused_step_index", 0),
-                    "goal": goal,
-                    "request_id": result.request_id,
+                    "steps": getattr(result, "steps", []),
+                    "state": getattr(result, "state", None),
+                    "step_index": result.state.data.get("paused_step_index", 0) if getattr(result, "state", None) else 0,
+                    "goal": message,
+                    "request_id": getattr(result, "request_id", ""),
                     "request_context": req_ctx,
                 }
 
-            self.chunk_received.emit(result.summary)
-            if self.voice_read_enabled or (hasattr(self, "voice_active") and self.voice_active):
-                speak(result.summary)
+            if getattr(result, "route", "") != "CHAT":
+                self.chunk_received.emit(reply_text)
+
+            if self.voice_read_enabled or voice_output or (hasattr(self, "voice_active") and self.voice_active):
+                speak(reply_text)
 
             self.end_ai_bubble.emit()
-            self.chats[self.current_chat]["messages"].append(f"Jarvis: {result.summary}")
+            self.chats[self.current_chat]["messages"].append(f"Jarvis: {reply_text}")
             save_json(CHATS_FILE, self.chats)
             self.status_changed.emit("Ready")
-            self.task_finished.emit(result.ok, result.summary)
-            self.event_bus.emit("ai_response", result.summary)
+            self.task_finished.emit(getattr(result, "ok", False), reply_text)
+            self.event_bus.emit("ai_response", reply_text)
 
-        t = threading.Thread(target=agent_task, daemon=True)
+            if getattr(result, "route", "") == "FAST_COMMAND" and hasattr(self, "voice_active") and self.voice_active:
+                self.stop_voice_chat()
+
+        t = threading.Thread(target=task_worker, daemon=True, name="UnifiedRequestWorker")
         t.start()
         return t
 
+    def process_agent_request(self, parsed):
+        goal = parsed.original_text if hasattr(parsed, "original_text") else str(parsed)
+        return self.process_request(goal, source="gui_agent")
+
     def process_ai_request(self, message: str):
-        from core.lifecycle import reset_current_request, set_current_request
-
-        self.profile = update_profile(self.profile, message)
-        save_json(PROFILE_FILE, self.profile)
-        prompt = self.build_prompt(message)
-        self.status_changed.emit("Premyslim...")
-
-        req_ctx = reset_current_request(goal=message, source="gui_chat")
-
-        threading.Thread(
-            target=speak,
-            args=(random.choice(["Mrknu na to.", "Moment.", "Zpracovavam.", "Rozumim."]),),
-            daemon=True,
-        ).start()
-
-        chat_model = self.chats[self.current_chat]["model"]
-
-        def ai_task():
-            set_current_request(req_ctx)
-            self.start_ai_bubble.emit()
-            response_generator = generate_stream(prompt, chat_model)
-            buffer = ""
-            full_reply = ""
-            for chunk in response_generator:
-                full_reply += chunk
-                buffer += chunk
-                self.chunk_received.emit(chunk)
-                if buffer.endswith(".") or buffer.endswith("?") or buffer.endswith("!"):
-                    if self.voice_read_enabled:
-                        speak(buffer)
-                    buffer = ""
-
-            if buffer.strip() and self.voice_read_enabled:
-                speak(buffer)
-
-            self.end_ai_bubble.emit()
-            self.chats[self.current_chat]["messages"].append(f"Jarvis: {full_reply}")
-            save_json(CHATS_FILE, self.chats)
-            self.status_changed.emit("Ready")
-            self.event_bus.emit("ai_response", full_reply)
-
-        threading.Thread(target=ai_task, daemon=True).start()
-        self.clear_input.emit()
-
-
+        return self.process_request(message, source="gui_chat")
 
     def start_recording(self):
         interrupt_speech()
@@ -544,54 +448,15 @@ class GuiController(QObject):
         threading.Thread(target=transcribe_task, daemon=True).start()
 
     def handle_voice_text(self, text: str):
-        from core.lifecycle import reset_current_request
-        reset_current_request(goal=text, source="voice")
-
         self.user_message_received.emit(f"Voice: {text}")
         self.chats[self.current_chat]["messages"].append(f"Ty: {text}")
         save_json(CHATS_FILE, self.chats)
-        self.status_changed.emit("Thinking...")
 
         if self.handle_router_preference_choice(text):
             return None
 
-        from core.intents import IntentType, classify_intent
-        parsed = classify_intent(text)
-
-        if parsed.intent != IntentType.CHAT and not parsed.requires_llm:
-            worker = self.process_agent_request(parsed)
-            from core.intents.fast_command_router import classify_routing_level
-            route_info = classify_routing_level(text)
-            if route_info["route"] == "FAST_COMMAND":
-                if hasattr(self, "voice_active") and self.voice_active:
-                    self.stop_voice_chat()
-            return worker
-
-        prompt = self.build_prompt(text)
-        chat_model = self.chats[self.current_chat]["model"]
-
-        def ai_task():
-            self.start_ai_bubble.emit()
-            self.status_changed.emit("Speaking...")
-            response_generator = generate_stream(prompt, chat_model)
-
-            def gui_stream():
-                for chunk in response_generator:
-                    yield chunk
-
-            def emit_chunk(chunk: str):
-                self.chunk_received.emit(chunk)
-
-            full_reply = voice_speak_stream(_emit_stream(gui_stream(), emit_chunk))
-
-            self.end_ai_bubble.emit()
-            self.chats[self.current_chat]["messages"].append(f"Jarvis: {full_reply}")
-            save_json(CHATS_FILE, self.chats)
-            self.status_changed.emit("Ready")
-            self.event_bus.emit("ai_response", full_reply)
-
-        worker = threading.Thread(target=ai_task, daemon=True, name="VoiceAITask")
-        worker.start()
+        # Route through unified request handler
+        worker = self.process_request(text, source="voice", voice_output=True)
         return worker
 
     def start_voice_chat(self):

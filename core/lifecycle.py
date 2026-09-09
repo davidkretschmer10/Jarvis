@@ -124,9 +124,12 @@ class RequestContext:
         """Set this RequestContext as the current active context on the executing thread."""
         set_current_request(self)
 
-    # --------------------------------------------------------------------------
-    # Backward Compatibility Properties
-    # --------------------------------------------------------------------------
+    def request_cancellation(self, reason: str = "") -> None:
+        with self._lock:
+            self.cancellation_requested = True
+            if reason:
+                self.error = reason
+
     @property
     def is_cancelled(self) -> bool:
         with self._lock:

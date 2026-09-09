@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from enum import Enum
 import os
 import time
 from typing import Any, Callable, Dict, List, Optional
@@ -29,21 +30,52 @@ StepCallback = Callable[[int, str], None]
 TaskStartCallback = Callable[[str, List[str]], None]
 
 
+class RequestExecutionStatus(str, Enum):
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+    WAITING_FOR_CONFIRMATION = "WAITING_FOR_CONFIRMATION"
+    PAUSED = "PAUSED"
+    TIMEOUT = "TIMEOUT"
+    CHAT_RESPONSE = "CHAT_RESPONSE"
+
+
 @dataclass
-class RuntimeResult:
+class RequestResult:
     ok: bool
     goal: str
     route: str
     confidence: float
-    steps: List[JSON]
-    results: List[JSON]
-    state: JarvisState
-    summary: str
-    request_id: str
+    steps: List[JSON] = field(default_factory=list)
+    results: List[JSON] = field(default_factory=list)
+    state: JarvisState = field(default_factory=JarvisState)
+    summary: str = ""
+    request_id: str = ""
+    status: RequestExecutionStatus | str = RequestExecutionStatus.COMPLETED
+    response_text: str = ""
+    execution_result: Optional[List[JSON]] = None
+    verification_summary: Optional[str] = None
+    error: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
     pending_confirmation: bool = False
     confirmation_message: str = ""
     fallback_occurred: bool = False
     fallback_reason: Optional[str] = None
+
+    def __post_init__(self):
+        if not self.response_text and self.summary:
+            self.response_text = self.summary
+        elif not self.summary and self.response_text:
+            self.summary = self.response_text
+        if self.execution_result is None and self.results:
+            self.execution_result = self.results
+        elif self.results is None and self.execution_result:
+            self.results = self.execution_result
+        if isinstance(self.status, RequestExecutionStatus):
+            self.status = self.status.value
+
+
+RuntimeResult = RequestResult
 
 
 class JarvisRuntime:
@@ -70,9 +102,10 @@ class JarvisRuntime:
         task_memory: Optional[TaskMemory] = None,
         on_step_update: Optional[StepCallback] = None,
         on_task_start: Optional[TaskStartCallback] = None,
+        on_chunk: Optional[Callable[[str], None]] = None,
         reset_request: bool = True,
         request_context: Optional[RequestContext] = None,
-    ) -> RuntimeResult:
+    ) -> RequestResult:
         if request_context is not None:
             ctx = request_context
             set_current_request(ctx)
@@ -96,8 +129,13 @@ class JarvisRuntime:
             or getattr(ctx, "status", None) in (RequestStatus.CANCELLED, RequestStatus.COMPLETED, RequestStatus.FAILED)
         ):
             term_status = getattr(getattr(ctx, "status", None), "value", "CANCELLED")
-            cancel_msg = f"Ukol byl odmitnut: request je jiz ve stavu {term_status}."
-            return RuntimeResult(
+            is_cancelled = (
+                getattr(ctx, "is_cancelled", False) is True
+                or getattr(ctx, "cancellation_requested", False) is True
+                or "CANCEL" in term_status
+            )
+            cancel_msg = "Ukol byl pred zahajenim zrusen." if is_cancelled else f"Ukol byl odmitnut: request je jiz ve stavu {term_status}."
+            return RequestResult(
                 ok=False,
                 goal=goal,
                 route="CANCELLED",
@@ -107,6 +145,8 @@ class JarvisRuntime:
                 state=state,
                 summary=cancel_msg,
                 request_id=request_id,
+                status=RequestExecutionStatus.CANCELLED if is_cancelled else RequestExecutionStatus.FAILED,
+                error=cancel_msg,
             )
 
         self._emit("task_requested", {"goal": goal, "request_id": request_id})
@@ -154,7 +194,7 @@ class JarvisRuntime:
                 except Exception:
                     pass
 
-            return RuntimeResult(
+            return RequestResult(
                 ok=False,
                 goal=goal,
                 route=level,
@@ -164,11 +204,69 @@ class JarvisRuntime:
                 state=state,
                 summary=message,
                 request_id=request_id,
+                status=RequestExecutionStatus.WAITING_FOR_CONFIRMATION,
+                response_text=message,
                 pending_confirmation=True,
                 confirmation_message=message,
             )
 
-        # --- PLANNING or DIRECT EXECUTING ---
+        # --- CHAT MODE (Pure conversational / inquiry request without tools) ---
+        if level == "CHAT":
+            self._emit("route_selected", {"route": "CHAT", "confidence": confidence})
+            if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
+                try:
+                    ctx.transition_to(RequestStatus.EXECUTING, event_bus=self.event_bus)
+                except Exception:
+                    pass
+
+            full_reply = ""
+            if on_chunk:
+                from ai.engine import generate_stream
+                try:
+                    for chunk in generate_stream(goal):
+                        if (
+                            getattr(ctx, "is_cancelled", False) is True
+                            or getattr(ctx, "cancellation_requested", False) is True
+                        ):
+                            break
+                        full_reply += chunk
+                        on_chunk(chunk)
+                except Exception as e:
+                    full_reply = f"Chyba při generování odpovědi: {e}"
+            else:
+                from ai.engine import ask_ai
+                try:
+                    full_reply = ask_ai(goal) or "Omlouvám se, nepodařilo se vygenerovat odpověď."
+                except Exception as e:
+                    full_reply = f"Chyba při komunikaci s AI: {e}"
+
+            if getattr(ctx, "is_cancelled", False) is True or getattr(ctx, "cancellation_requested", False) is True:
+                cancel_current_request(reason="Chat zrušen.", event_bus=self.event_bus)
+                status = RequestExecutionStatus.CANCELLED
+                ok = False
+            else:
+                complete_current_request(result=full_reply, event_bus=self.event_bus)
+                status = RequestExecutionStatus.CHAT_RESPONSE
+                ok = True
+
+            result = RequestResult(
+                ok=ok,
+                goal=goal,
+                route="CHAT",
+                confidence=confidence,
+                steps=[],
+                results=[],
+                state=state,
+                summary=full_reply,
+                request_id=request_id,
+                status=status,
+                response_text=full_reply,
+                execution_result=[],
+            )
+            self._emit("task_finished", result)
+            return result
+
+        # --- PLANNING or DIRECT EXECUTING (Action / Mixed) ---
         if level == "FAST_COMMAND":
             if step:
                 steps = [step]
@@ -193,7 +291,7 @@ class JarvisRuntime:
                 goal, level, fallback_occurred, fallback_reason
             )
 
-        if level == "PLANNER_V2":
+        if level in ("PLANNER_V2", "MIXED"):
             use_task_memory = True
             if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
                 try:
@@ -202,7 +300,7 @@ class JarvisRuntime:
                     pass
             steps = Planner(registry=self.registry).plan(goal)
 
-        if steps and level in ("MINI_PLANNER", "PLANNER_V2"):
+        if steps and level in ("MINI_PLANNER", "PLANNER_V2", "MIXED"):
             self._emit("planning_completed", {"request_id": request_id, "steps_count": len(steps), "steps": steps})
             if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
                 try:
@@ -221,7 +319,7 @@ class JarvisRuntime:
         if not steps:
             fail_current_request()
             summary = "Chyba: Nepodarilo se vygenerovat plan."
-            return RuntimeResult(
+            return RequestResult(
                 ok=False,
                 goal=goal,
                 route=level,
@@ -231,6 +329,8 @@ class JarvisRuntime:
                 state=state,
                 summary=summary,
                 request_id=request_id,
+                status=RequestExecutionStatus.FAILED,
+                error=summary,
                 fallback_occurred=fallback_occurred,
                 fallback_reason=fallback_reason,
             )
@@ -278,6 +378,7 @@ class JarvisRuntime:
         if pending_confirmation:
             confirmation_message = state.data.get("user_help_required", "Akce vyzaduje potvrzeni.")
             summary = confirmation_message
+            status = RequestExecutionStatus.WAITING_FOR_CONFIRMATION
             if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
                 try:
                     ctx.transition_to(
@@ -289,16 +390,19 @@ class JarvisRuntime:
                     pass
         elif ok:
             complete_current_request(result=summary, event_bus=self.event_bus)
+            status = RequestExecutionStatus.COMPLETED
         elif (
             getattr(ctx, "is_cancelled", False) is True
             or getattr(ctx, "cancellation_requested", False) is True
             or getattr(ctx, "status", None) == RequestStatus.CANCELLED
         ):
             cancel_current_request(reason=summary, event_bus=self.event_bus)
+            status = RequestExecutionStatus.CANCELLED
         else:
             fail_current_request(error=summary, event_bus=self.event_bus)
+            status = RequestExecutionStatus.FAILED
 
-        result = RuntimeResult(
+        result = RequestResult(
             ok=ok,
             goal=goal,
             route=level,
@@ -308,6 +412,10 @@ class JarvisRuntime:
             state=state,
             summary=summary,
             request_id=request_id,
+            status=status,
+            response_text=summary,
+            execution_result=results,
+            error=summary if not ok and status != RequestExecutionStatus.WAITING_FOR_CONFIRMATION else None,
             pending_confirmation=pending_confirmation,
             confirmation_message=state.data.get("user_help_required", ""),
             fallback_occurred=fallback_occurred,
@@ -408,18 +516,24 @@ class JarvisRuntime:
                     )
                 except Exception:
                     pass
+        if pending_confirmation:
+            status = RequestExecutionStatus.WAITING_FOR_CONFIRMATION
         elif ok:
             complete_current_request(result=summary, event_bus=self.event_bus)
+            status = RequestExecutionStatus.COMPLETED
         elif (
             getattr(ctx, "is_cancelled", False) is True
             or getattr(ctx, "cancellation_requested", False) is True
             or getattr(ctx, "status", None) == RequestStatus.CANCELLED
         ):
             cancel_current_request(reason=summary, event_bus=self.event_bus)
+            status = RequestExecutionStatus.CANCELLED
         else:
             fail_current_request(error=summary, event_bus=self.event_bus)
+            status = RequestExecutionStatus.FAILED
 
-        return RuntimeResult(
+        resp_text = summary if not pending_confirmation else state.data.get("user_help_required", summary)
+        result = RuntimeResult(
             ok=ok,
             goal=goal,
             route="RESUME",
@@ -427,11 +541,17 @@ class JarvisRuntime:
             steps=steps,
             results=results,
             state=state,
-            summary=summary if not pending_confirmation else state.data.get("user_help_required", summary),
+            summary=resp_text,
             request_id=getattr(ctx, "request_id", ""),
+            status=status,
+            response_text=resp_text,
+            execution_result=results,
+            error=summary if not ok and status != RequestExecutionStatus.WAITING_FOR_CONFIRMATION else None,
             pending_confirmation=pending_confirmation,
             confirmation_message=state.data.get("user_help_required", ""),
         )
+        self._emit("task_finished", result)
+        return result
 
     def _plan_with_fallback(
         self,

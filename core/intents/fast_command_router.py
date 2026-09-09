@@ -366,6 +366,25 @@ def classify_routing_level(goal: str) -> Dict[str, Any]:
     cleaned = strip_greetings(goal)
     norm = normalize_text(cleaned)
 
+    action_keywords = [
+        "otevri", "zapni", "spust", "pust", "vyhledej", "najdi",
+        "vytvor", "smaz", "odstran", "klikni", "stiskni", "zmackni",
+        "screenshot", "snimek", "ocr", "precti", "zavri", "prepni",
+        "stopni", "pauzni", "vypis", "refresh",
+    ]
+    has_action_keyword = any(ak in norm for ak in action_keywords)
+
+    chat_indicators = ["rekni mi", "kolik je", "jaky je", "co je", "vysvetli", "napis mi", "jestli", "jak se"]
+    has_chat_indicator = any(ci in norm for ci in chat_indicators)
+
+    if has_chat_indicator and has_action_keyword:
+        return {
+            "route": "MIXED",
+            "confidence": 0.95,
+            "step": None,
+            "candidates": None,
+        }
+
     planner_v2_keywords = [
         "vytvor",
         "prezentac",
@@ -385,6 +404,17 @@ def classify_routing_level(goal: str) -> Dict[str, Any]:
                 "step": None,
                 "candidates": None,
             }
+
+    from core.intents.intent_classifier import classify_intent
+    from core.intents.intent_types import IntentType
+    parsed = classify_intent(goal)
+    if parsed.intent == IntentType.CHAT and not has_action_keyword:
+        return {
+            "route": "CHAT",
+            "confidence": 1.0,
+            "step": None,
+            "candidates": None,
+        }
 
     return {
         "route": "MINI_PLANNER",
