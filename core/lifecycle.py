@@ -38,6 +38,7 @@ VALID_TRANSITIONS: Dict[RequestStatus, Set[RequestStatus]] = {
         RequestStatus.ROUTING,
         RequestStatus.PLANNING,
         RequestStatus.EXECUTING,
+        RequestStatus.WAITING_FOR_USER,
         RequestStatus.COMPLETED,
         RequestStatus.CANCELLED,
         RequestStatus.FAILED,
@@ -93,9 +94,13 @@ class RequestContext:
         request_id: Optional[str] = None,
         goal: str = "",
         source: str = "unknown",
+        parent_request_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         self._lock = threading.RLock()
         self.request_id: str = request_id or uuid.uuid4().hex[:8]
+        self.parent_request_id: Optional[str] = parent_request_id
+        self.metadata: Dict[str, Any] = metadata or {}
         self.goal: str = goal
         self.source: str = source
         self.status: RequestStatus = RequestStatus.CREATED
@@ -115,9 +120,18 @@ class RequestContext:
     def get_active_count(cls) -> int:
         return len(cls._instances)
 
+    def copy_to_thread(self) -> None:
+        """Set this RequestContext as the current active context on the executing thread."""
+        set_current_request(self)
+
     # --------------------------------------------------------------------------
     # Backward Compatibility Properties
     # --------------------------------------------------------------------------
+    @property
+    def is_cancelled(self) -> bool:
+        with self._lock:
+            return self.cancellation_requested or self.status == RequestStatus.CANCELLED
+
     @property
     def completed(self) -> bool:
         with self._lock:
@@ -129,7 +143,11 @@ class RequestContext:
             if value and self.status != RequestStatus.COMPLETED:
                 self.transition_to(RequestStatus.COMPLETED)
             elif not value and self.status == RequestStatus.COMPLETED:
-                self.status = RequestStatus.CREATED
+                raise InvalidStateTransitionError(
+                    from_status=self.status,
+                    to_status=RequestStatus.CREATED,
+                    request_id=self.request_id,
+                )
 
     @property
     def cancelled(self) -> bool:
@@ -143,8 +161,11 @@ class RequestContext:
                 self.cancellation_requested = True
                 self.transition_to(RequestStatus.CANCELLED)
             elif not value and self.status == RequestStatus.CANCELLED:
-                self.cancellation_requested = False
-                self.status = RequestStatus.CREATED
+                raise InvalidStateTransitionError(
+                    from_status=self.status,
+                    to_status=RequestStatus.CREATED,
+                    request_id=self.request_id,
+                )
 
     @property
     def failed(self) -> bool:
@@ -157,7 +178,11 @@ class RequestContext:
             if value and self.status != RequestStatus.FAILED:
                 self.transition_to(RequestStatus.FAILED)
             elif not value and self.status == RequestStatus.FAILED:
-                self.status = RequestStatus.CREATED
+                raise InvalidStateTransitionError(
+                    from_status=self.status,
+                    to_status=RequestStatus.CREATED,
+                    request_id=self.request_id,
+                )
 
     @property
     def start_time(self) -> float:

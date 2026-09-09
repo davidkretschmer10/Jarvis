@@ -5,15 +5,17 @@ import os
 import time
 from typing import Any, Callable, Dict, List, Optional
 
-from core.executor import Executor
+from core.executor import Executor, StepExecutionStatus
 from core.intents.fast_command_router import classify_routing_level, increment_router_stat
 from core.lifecycle import (
     RequestContext,
     RequestStatus,
+    cancel_current_request,
     complete_current_request,
     fail_current_request,
     get_current_request,
     reset_current_request,
+    set_current_request,
 )
 from core.planner import Planner
 from core.state import JarvisState
@@ -69,8 +71,14 @@ class JarvisRuntime:
         on_step_update: Optional[StepCallback] = None,
         on_task_start: Optional[TaskStartCallback] = None,
         reset_request: bool = True,
+        request_context: Optional[RequestContext] = None,
     ) -> RuntimeResult:
-        if reset_request:
+        if request_context is not None:
+            ctx = request_context
+            set_current_request(ctx)
+            if hasattr(ctx, "goal") and not ctx.goal:
+                ctx.goal = goal
+        elif reset_request:
             ctx = reset_current_request(goal=goal, source="runtime")
         else:
             ctx = get_current_request()
@@ -79,6 +87,27 @@ class JarvisRuntime:
 
         request_id = getattr(ctx, "request_id", "")
         state = state or JarvisState()
+
+        # Invariant: Do not execute if request context is already cancelled or terminal
+        if (
+            getattr(ctx, "is_cancelled", False) is True
+            or getattr(ctx, "cancellation_requested", False) is True
+            or getattr(ctx, "is_terminal", False) is True
+            or getattr(ctx, "status", None) in (RequestStatus.CANCELLED, RequestStatus.COMPLETED, RequestStatus.FAILED)
+        ):
+            term_status = getattr(getattr(ctx, "status", None), "value", "CANCELLED")
+            cancel_msg = f"Ukol byl odmitnut: request je jiz ve stavu {term_status}."
+            return RuntimeResult(
+                ok=False,
+                goal=goal,
+                route="CANCELLED",
+                confidence=1.0,
+                steps=[],
+                results=[],
+                state=state,
+                summary=cancel_msg,
+                request_id=request_id,
+            )
 
         self._emit("task_requested", {"goal": goal, "request_id": request_id})
         self._emit("request_created", {"goal": goal, "request_id": request_id})
@@ -210,6 +239,7 @@ class JarvisRuntime:
             dry_run=self.dry_run,
             agent_base_url=self.agent_base_url,
             workspace_root=self.workspace_root,
+            request_context=ctx if isinstance(ctx, RequestContext) else None,
         )
         if on_task_start:
             on_task_start(
@@ -234,7 +264,6 @@ class JarvisRuntime:
         )
         results = executor.run_plan(steps)
 
-
         # --- VERIFYING ---
         if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
             if not ("paused_step_index" in state.data or state.data.get("user_help_required")):
@@ -243,9 +272,9 @@ class JarvisRuntime:
                 except Exception:
                     pass
 
-        ok, summary, pending_confirmation = self._summarize_execution(results, state, len(steps))
+        ok, summary, pending_confirmation = self._summarize_execution(results, state, len(steps), ctx=ctx)
 
-        # --- COMPLETING / FAILING / WAITING ---
+        # --- COMPLETING / FAILING / WAITING / CANCELLING ---
         if pending_confirmation:
             confirmation_message = state.data.get("user_help_required", "Akce vyzaduje potvrzeni.")
             summary = confirmation_message
@@ -260,6 +289,12 @@ class JarvisRuntime:
                     pass
         elif ok:
             complete_current_request(result=summary, event_bus=self.event_bus)
+        elif (
+            getattr(ctx, "is_cancelled", False) is True
+            or getattr(ctx, "cancellation_requested", False) is True
+            or getattr(ctx, "status", None) == RequestStatus.CANCELLED
+        ):
+            cancel_current_request(reason=summary, event_bus=self.event_bus)
         else:
             fail_current_request(error=summary, event_bus=self.event_bus)
 
@@ -290,8 +325,35 @@ class JarvisRuntime:
         task_memory: Optional[TaskMemory] = None,
         on_step_update: Optional[StepCallback] = None,
         on_task_start: Optional[TaskStartCallback] = None,
+        expected_request_id: Optional[str] = None,
+        request_context: Optional[RequestContext] = None,
     ) -> RuntimeResult:
-        ctx = get_current_request()
+        if request_context is not None:
+            ctx = request_context
+            set_current_request(ctx)
+        else:
+            ctx = get_current_request()
+
+        # Invariant: Terminal requests cannot be resumed
+        if getattr(ctx, "is_terminal", False):
+            raise RuntimeError(
+                f"Cannot resume request '{getattr(ctx, 'request_id', '')}' in terminal state '{getattr(ctx, 'status', '')}'."
+            )
+
+        # Invariant: Validate confirmation binding
+        pending_conf = state.data.get("pending_confirmation")
+        if expected_request_id:
+            if pending_conf and pending_conf.get("request_id") and pending_conf.get("request_id") != expected_request_id:
+                raise ValueError(
+                    f"Confirmation mismatch: expected request_id {expected_request_id}, "
+                    f"but pending confirmation is for {pending_conf.get('request_id')}"
+                )
+            if getattr(ctx, "request_id", "") and getattr(ctx, "request_id", "") != expected_request_id:
+                raise ValueError(
+                    f"Confirmation mismatch: expected request_id {expected_request_id}, "
+                    f"but current context request_id is {getattr(ctx, 'request_id', '')}"
+                )
+
         if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
             try:
                 ctx.transition_to(RequestStatus.EXECUTING, event_bus=self.event_bus, start_index=start_index)
@@ -301,6 +363,7 @@ class JarvisRuntime:
         state.data["action_confirmed"] = True
         state.data.pop("user_help_required", None)
         state.data.pop("paused_step_index", None)
+        state.data.pop("pending_confirmation", None)
 
         remaining_steps = steps[start_index:]
         if on_task_start:
@@ -312,6 +375,7 @@ class JarvisRuntime:
             dry_run=self.dry_run,
             agent_base_url=self.agent_base_url,
             workspace_root=self.workspace_root,
+            request_context=ctx if isinstance(ctx, RequestContext) else None,
         )
         planner_inst = Planner(registry=self.registry)
         executor = Executor(
@@ -326,7 +390,6 @@ class JarvisRuntime:
         )
         results = executor.run_plan(remaining_steps)
 
-
         if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
             if not ("paused_step_index" in state.data or state.data.get("user_help_required")):
                 try:
@@ -334,12 +397,8 @@ class JarvisRuntime:
                 except Exception:
                     pass
 
-        ok, summary, pending_confirmation = self._summarize_execution(results, state, len(steps), start_index)
-        if ok:
-            complete_current_request(result=summary, event_bus=self.event_bus)
-        elif not pending_confirmation:
-            fail_current_request(error=summary, event_bus=self.event_bus)
-        else:
+        ok, summary, pending_confirmation = self._summarize_execution(results, state, len(steps), start_index, ctx=ctx)
+        if pending_confirmation:
             if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
                 try:
                     ctx.transition_to(
@@ -349,6 +408,16 @@ class JarvisRuntime:
                     )
                 except Exception:
                     pass
+        elif ok:
+            complete_current_request(result=summary, event_bus=self.event_bus)
+        elif (
+            getattr(ctx, "is_cancelled", False) is True
+            or getattr(ctx, "cancellation_requested", False) is True
+            or getattr(ctx, "status", None) == RequestStatus.CANCELLED
+        ):
+            cancel_current_request(reason=summary, event_bus=self.event_bus)
+        else:
+            fail_current_request(error=summary, event_bus=self.event_bus)
 
         return RuntimeResult(
             ok=ok,
@@ -390,7 +459,18 @@ class JarvisRuntime:
         state: JarvisState,
         total_steps: int,
         start_index: int = 0,
+        ctx: Optional[RequestContext] = None,
     ) -> tuple[bool, str, bool]:
+        # 1. Check if request context is cancelled
+        if ctx is not None:
+            if (
+                getattr(ctx, "is_cancelled", False) is True
+                or getattr(ctx, "cancellation_requested", False) is True
+                or getattr(ctx, "status", None) == RequestStatus.CANCELLED
+            ):
+                return False, "Ukol byl zrusen pred dokoncenim.", False
+
+        # 2. Check if confirmation is pending or paused
         if "paused_step_index" in state.data:
             return False, state.data.get("user_help_required", "Akce vyzaduje potvrzeni."), True
 
@@ -398,10 +478,27 @@ class JarvisRuntime:
         if help_required:
             return False, f"Chyba behem provadeni: {help_required}", False
 
-        if results and not results[-1]["output"].get("ok", False):
-            step_no = start_index + len(results)
-            error = results[-1]["output"].get("error", "Neznama chyba")
-            return False, f"Ukol selhal na kroku {step_no}: {error}", False
+        # 3. If no steps were executed or results is empty when steps were expected
+        if total_steps > 0 and not results:
+            return False, "Nebyly provedeny zadne kroky.", False
+
+        # 4. Check if any executed step failed / cancelled / timed out
+        for idx, res in enumerate(results):
+            out = res.get("output", {})
+            status = res.get("status")
+            if status in ("CANCELLED", StepExecutionStatus.CANCELLED.value):
+                return False, f"Ukol byl zrusen na kroku {start_index + idx + 1}.", False
+            if status in ("TIMEOUT", StepExecutionStatus.TIMEOUT.value):
+                return False, f"Ukol vyprsel (timeout) na kroku {start_index + idx + 1}.", False
+            if not out.get("ok", False):
+                step_no = start_index + idx + 1
+                error = out.get("error", "Neznama chyba")
+                return False, f"Ukol selhal na kroku {step_no}: {error}", False
+
+        # 5. Check completed count vs total planned steps
+        executed_count = len(results)
+        if total_steps > 0 and (start_index + executed_count) < total_steps:
+            return False, f"Ukol nebyl dokoncen: provedeno {start_index + executed_count} z {total_steps} kroku.", False
 
         return True, f"Ukol byl uspesne dokoncen! Celkem provedeno {total_steps} kroku.", False
 

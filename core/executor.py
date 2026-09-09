@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 import json
+import logging
 import re
 from typing import Any, Dict, List, Callable, Optional
 
@@ -13,7 +15,68 @@ from core.state import JarvisState
 from core.template import render_templates
 from core.task_memory import TaskMemory
 
+logger = logging.getLogger(__name__)
+
 JSON = Dict[str, Any]
+
+
+class StepExecutionStatus(str, Enum):
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+    PAUSED = "PAUSED"
+    WAITING_FOR_CONFIRMATION = "WAITING_FOR_CONFIRMATION"
+    CANCELLED = "CANCELLED"
+    TIMEOUT = "TIMEOUT"
+    REPLANNED = "REPLANNED"
+    TERMINAL_ERROR = "TERMINAL_ERROR"
+
+
+class StepResult(dict):
+    """
+    Structured step result subclassing dict for 100% backwards compatibility
+    with existing dict-based result consumers, while providing explicit
+    execution statuses, verification tracking, and invariants.
+    """
+
+    def __init__(
+        self,
+        step_index: int,
+        tool: str,
+        input: Dict[str, Any],
+        output: Dict[str, Any],
+        status: StepExecutionStatus,
+        execution_status: str,
+        verification_status: str = "unverified",
+        verification_evidence: Optional[Dict[str, Any]] = None,
+        error: Optional[str] = None,
+        state_snapshot: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__(
+            step=step_index,
+            tool=tool,
+            input=input,
+            output=output,
+            status=status.value,
+            execution_status=execution_status,
+            verification_status=verification_status,
+            verification_evidence=verification_evidence,
+            error=error,
+            state=state_snapshot,
+        )
+        self.step_index: int = step_index
+        self.tool: str = tool
+        self.tool_input: Dict[str, Any] = input
+        self.output: Dict[str, Any] = output
+        self.status: StepExecutionStatus = status
+        self.execution_status: str = execution_status
+        self.verification_status: str = verification_status
+        self.verification_evidence: Optional[Dict[str, Any]] = verification_evidence
+        self.error: Optional[str] = error
+        self.state_snapshot: Optional[Dict[str, Any]] = state_snapshot
+
+    @property
+    def is_success(self) -> bool:
+        return self.status == StepExecutionStatus.SUCCESS and bool(self.output.get("ok", False))
 
 
 @dataclass
@@ -31,6 +94,14 @@ class Executor:
     max_repairs: int = 1
     max_replans: int = 2
 
+    def _is_cancelled(self) -> bool:
+        if not self.request_context:
+            return False
+        return bool(
+            getattr(self.request_context, "cancellation_requested", False) is True
+            or getattr(self.request_context, "is_cancelled", False) is True
+            or getattr(self.request_context, "status", None) == RequestStatus.CANCELLED
+        )
 
     def run_plan(self, steps: List[JSON]) -> List[JSON]:
         results: List[JSON] = []
@@ -46,8 +117,10 @@ class Executor:
         step_idx = 0
         total_executed_steps = 0
         replans_count = 0
+        repairs_count = 0
 
         while step_idx < len(current_steps):
+            # 1. Check maximum executed step limit (Timeout / Runaway safeguard)
             if total_executed_steps >= self.max_steps:
                 err_msg = f"Překročen maximální počet kroků ({self.max_steps})."
                 print(f"[EXECUTOR] {err_msg}")
@@ -56,8 +129,25 @@ class Executor:
                 self.state.data["user_help_required"] = err_msg
                 break
 
-            if self.request_context and (self.request_context.cancellation_requested or self.request_context.status == RequestStatus.CANCELLED):
+            # 2. Check cancellation before step execution
+            if self._is_cancelled():
                 print(f"[EXECUTOR] Execution cancelled at step {step_idx+1}")
+                if self.task_memory:
+                    self.task_memory.update_step_status(step_idx, "cancelled")
+                if self.on_step_update:
+                    self.on_step_update(step_idx, "cancelled")
+                if self.event_bus:
+                    self.event_bus.emit(
+                        "step_completed",
+                        {
+                            "request_id": self.request_context.request_id if self.request_context else "",
+                            "step_index": step_idx + 1,
+                            "tool": str(current_steps[step_idx].get("tool", "")),
+                            "ok": False,
+                            "status": "cancelled",
+                            "error": "Request cancelled",
+                        },
+                    )
                 break
 
             step = current_steps[step_idx]
@@ -89,26 +179,82 @@ class Executor:
             tool_input = render_templates(tool_input, self.state)
             total_executed_steps += 1
 
-            # 1. Execute tool with retry for transient errors
+            # 3. Execute tool with cooperative retry
             out = None
+            cancelled_during_run = False
+
             for attempt in range(1 + self.max_retries):
+                if self._is_cancelled():
+                    cancelled_during_run = True
+                    break
+
                 out = self.registry.run(tool_name, tool_input, self.ctx, self.state)
                 if out.get("ok", False):
                     break
+
                 err = str(out.get("error", ""))
                 if "CONFIRMATION_REQUIRED" in err or "VisionError" in err:
                     break
-                if attempt < self.max_retries:
-                    print(f"[EXECUTOR] Step {step_idx+1} tool '{tool_name}' failed attempt {attempt+1}. Retrying...")
 
-            # 2. Check execution outcome
+                if attempt < self.max_retries:
+                    if self._is_cancelled():
+                        cancelled_during_run = True
+                        break
+                    print(f"[EXECUTOR] Step {step_idx+1} tool '{tool_name}' failed attempt {attempt+1}. Retrying...")
+                    if self.event_bus:
+                        self.event_bus.emit(
+                            "step_retry",
+                            {
+                                "request_id": self.request_context.request_id if self.request_context else "",
+                                "step_index": step_idx + 1,
+                                "tool": tool_name,
+                                "attempt": attempt + 1,
+                                "max_retries": self.max_retries,
+                                "error": err,
+                            },
+                        )
+
+            # Check if cancelled during tool execution / retry
+            if cancelled_during_run or self._is_cancelled():
+                print(f"[EXECUTOR] Execution cancelled during/after tool run at step {step_idx+1}")
+                if self.task_memory:
+                    self.task_memory.update_step_status(step_idx, "cancelled")
+                if self.on_step_update:
+                    self.on_step_update(step_idx, "cancelled")
+                step_res = StepResult(
+                    step_index=step_idx + 1,
+                    tool=tool_name,
+                    input=tool_input,
+                    output=out or {"ok": False, "error": "Cancelled"},
+                    status=StepExecutionStatus.CANCELLED,
+                    execution_status="cancelled",
+                    error="Execution cancelled",
+                    state_snapshot=self.state.snapshot(),
+                )
+                results.append(step_res)
+                if self.event_bus:
+                    self.event_bus.emit(
+                        "step_completed",
+                        {
+                            "request_id": self.request_context.request_id if self.request_context else "",
+                            "step_index": step_idx + 1,
+                            "tool": tool_name,
+                            "ok": False,
+                            "status": "cancelled",
+                            "error": "Request cancelled",
+                        },
+                    )
+                break
+
+            out = out or {"ok": False, "error": "No output produced"}
+
+            # 4. Check execution outcome
             if not out.get("ok", False):
                 error_msg = str(out.get("error", "Neznámá chyba"))
 
-                # VisionError handling
+                # Case A: VisionError handling
                 if "VisionError" in error_msg:
-                    import logging
-                    logging.getLogger(__name__).error("Vision error during execution: %s", error_msg)
+                    logger.error("Vision error during execution: %s", error_msg)
                     czech_msg = "Vision systém není dostupný. Zkontrolujte instalaci OCR."
                     if self.task_memory:
                         self.task_memory.update_step_status(step_idx, "failed", czech_msg)
@@ -118,18 +264,19 @@ class Executor:
                         self.request_context.transition_to(RequestStatus.FAILED, error=czech_msg, event_bus=self.event_bus)
                     self.state.data["user_help_required"] = czech_msg
 
-                    self._update_state_after_step(
-                        step_idx, tool_name, tool_input, {"ok": False, "error": "VisionError", "result": czech_msg}
+                    failed_out = {"ok": False, "error": "VisionError", "result": czech_msg}
+                    self._update_state_after_step(step_idx, tool_name, tool_input, failed_out)
+                    step_res = StepResult(
+                        step_index=step_idx + 1,
+                        tool=tool_name,
+                        input=tool_input,
+                        output=failed_out,
+                        status=StepExecutionStatus.FAILED,
+                        execution_status="failed",
+                        error=czech_msg,
+                        state_snapshot=self.state.snapshot(),
                     )
-                    results.append(
-                        {
-                            "step": step_idx + 1,
-                            "tool": tool_name,
-                            "input": tool_input,
-                            "output": {"ok": False, "error": "VisionError", "result": czech_msg},
-                            "state": self.state.snapshot(),
-                        }
-                    )
+                    results.append(step_res)
                     if self.event_bus:
                         self.event_bus.emit(
                             "step_completed",
@@ -143,8 +290,11 @@ class Executor:
                         )
                     break
 
-                # CONFIRMATION_REQUIRED handling
+                # Case B: CONFIRMATION_REQUIRED handling
                 if error_msg == "CONFIRMATION_REQUIRED":
+                    req_id = self.request_context.request_id if self.request_context else ""
+                    conf_message = out.get("message", "Akce vyžaduje potvrzení.")
+
                     if self.task_memory:
                         self.task_memory.update_step_status(step_idx, "paused")
                     if self.on_step_update:
@@ -153,26 +303,36 @@ class Executor:
                         self.request_context.transition_to(
                             RequestStatus.WAITING_FOR_USER,
                             event_bus=self.event_bus,
-                            message=out.get("message", "Akce vyžaduje potvrzení."),
+                            message=conf_message,
                         )
+
                     self.state.data["paused_step_index"] = step_idx
-                    self.state.data["user_help_required"] = out.get("message", "Akce vyžaduje potvrzení.")
+                    self.state.data["user_help_required"] = conf_message
+                    self.state.data["pending_confirmation"] = {
+                        "request_id": req_id,
+                        "step_index": step_idx,
+                        "tool": tool_name,
+                        "action": tool_input.get("action", ""),
+                        "message": conf_message,
+                    }
 
                     self._update_state_after_step(step_idx, tool_name, tool_input, out)
-                    results.append(
-                        {
-                            "step": step_idx + 1,
-                            "tool": tool_name,
-                            "input": tool_input,
-                            "output": out,
-                            "state": self.state.snapshot(),
-                        }
+                    step_res = StepResult(
+                        step_index=step_idx + 1,
+                        tool=tool_name,
+                        input=tool_input,
+                        output=out,
+                        status=StepExecutionStatus.WAITING_FOR_CONFIRMATION,
+                        execution_status="waiting_for_confirmation",
+                        error="CONFIRMATION_REQUIRED",
+                        state_snapshot=self.state.snapshot(),
                     )
+                    results.append(step_res)
                     if self.event_bus:
                         self.event_bus.emit(
                             "step_completed",
                             {
-                                "request_id": self.request_context.request_id if self.request_context else "",
+                                "request_id": req_id,
                                 "step_index": step_idx + 1,
                                 "tool": tool_name,
                                 "ok": False,
@@ -181,8 +341,42 @@ class Executor:
                         )
                     break
 
-                # 3. Auto-repair
-                repaired = self._attempt_repair(step, error_msg)
+                # Case C: Auto-repair (with cancellation & hard limit check)
+                repaired = False
+                if not self._is_cancelled() and repairs_count < self.max_repairs:
+                    repairs_count += 1
+                    if self.event_bus:
+                        self.event_bus.emit(
+                            "step_repair",
+                            {
+                                "request_id": self.request_context.request_id if self.request_context else "",
+                                "step_index": step_idx + 1,
+                                "repairs_count": repairs_count,
+                                "max_repairs": self.max_repairs,
+                                "error": error_msg,
+                            },
+                        )
+                    repaired = self._attempt_repair(step, error_msg)
+
+                if self._is_cancelled():
+                    print(f"[EXECUTOR] Execution cancelled after repair attempt at step {step_idx+1}")
+                    if self.task_memory:
+                        self.task_memory.update_step_status(step_idx, "cancelled")
+                    if self.on_step_update:
+                        self.on_step_update(step_idx, "cancelled")
+                    step_res = StepResult(
+                        step_index=step_idx + 1,
+                        tool=tool_name,
+                        input=tool_input,
+                        output={"ok": False, "error": "Cancelled"},
+                        status=StepExecutionStatus.CANCELLED,
+                        execution_status="cancelled",
+                        error="Execution cancelled",
+                        state_snapshot=self.state.snapshot(),
+                    )
+                    results.append(step_res)
+                    break
+
                 if repaired:
                     out = {
                         "ok": True,
@@ -193,11 +387,29 @@ class Executor:
                     if self.on_step_update:
                         self.on_step_update(step_idx, "completed")
                 else:
-                    # 4. Replanning fallback if repair failed
-                    if replans_count < self.max_replans and self.planner and hasattr(self.planner, "replan"):
+                    # Case D: Replanning fallback (with cancellation & hard limit check)
+                    if (
+                        not self._is_cancelled()
+                        and replans_count < self.max_replans
+                        and self.planner
+                        and hasattr(self.planner, "replan")
+                    ):
                         print(f"[EXECUTOR] Attempting replan ({replans_count + 1}/{self.max_replans})...")
                         goal_str = getattr(self.request_context, "goal", "") or self.state.last_output
+                        if self.event_bus:
+                            self.event_bus.emit(
+                                "replanning_started",
+                                {
+                                    "request_id": self.request_context.request_id if self.request_context else "",
+                                    "step_index": step_idx + 1,
+                                    "replans_count": replans_count + 1,
+                                },
+                            )
                         new_sub_steps = self.planner.replan(goal_str, step, error_msg, self.state)
+                        if self._is_cancelled():
+                            print(f"[EXECUTOR] Execution cancelled during replan at step {step_idx+1}")
+                            break
+
                         if new_sub_steps:
                             replans_count += 1
                             print(f"[EXECUTOR] Replan produced {len(new_sub_steps)} new steps.")
@@ -207,10 +419,13 @@ class Executor:
                             if self.task_memory:
                                 self.task_memory.start_task(goal_str, current_steps)
                             if self.event_bus:
-                                self.event_bus.emit("replanning_completed", {"new_steps": new_sub_steps, "replans_count": replans_count})
+                                self.event_bus.emit(
+                                    "replanning_completed",
+                                    {"new_steps": new_sub_steps, "replans_count": replans_count},
+                                )
                             continue
 
-                    # Mark step as failed if repair and replan failed
+                    # Case E: Terminal failure when repair and replan cannot recover
                     if self.task_memory:
                         self.task_memory.update_step_status(step_idx, "failed", error_msg)
                     if self.on_step_update:
@@ -219,15 +434,17 @@ class Executor:
                         self.request_context.transition_to(RequestStatus.FAILED, error=error_msg, event_bus=self.event_bus)
 
                     self._update_state_after_step(step_idx, tool_name, tool_input, out)
-                    results.append(
-                        {
-                            "step": step_idx + 1,
-                            "tool": tool_name,
-                            "input": tool_input,
-                            "output": out,
-                            "state": self.state.snapshot(),
-                        }
+                    step_res = StepResult(
+                        step_index=step_idx + 1,
+                        tool=tool_name,
+                        input=tool_input,
+                        output=out,
+                        status=StepExecutionStatus.FAILED,
+                        execution_status="failed",
+                        error=error_msg,
+                        state_snapshot=self.state.snapshot(),
                     )
+                    results.append(step_res)
                     if self.event_bus:
                         self.event_bus.emit(
                             "step_completed",
@@ -241,13 +458,18 @@ class Executor:
                         )
                     break
             else:
-                # Update status to completed
+                # Step was successful without repair
                 if self.task_memory:
                     self.task_memory.update_step_status(step_idx, "completed", str(out.get("result", "")))
                 if self.on_step_update:
                     self.on_step_update(step_idx, "completed")
 
-            # State updates
+            # Invariant check: only reached if step succeeded natively or was successfully auto-repaired
+            if self._is_cancelled():
+                print(f"[EXECUTOR] Execution cancelled right after step completion at step {step_idx+1}")
+                break
+
+            # State updates for successful step
             self._update_state_after_step(step_idx, tool_name, tool_input, out)
 
             if self.event_bus:
@@ -267,15 +489,17 @@ class Executor:
             print("[TOOL OUTPUT]", out)
             print("[STATE]", self.state.snapshot())
 
-            results.append(
-                {
-                    "step": step_idx + 1,
-                    "tool": tool_name,
-                    "input": tool_input,
-                    "output": out,
-                    "state": self.state.snapshot(),
-                }
+            step_res = StepResult(
+                step_index=step_idx + 1,
+                tool=tool_name,
+                input=tool_input,
+                output=out,
+                status=StepExecutionStatus.SUCCESS,
+                execution_status="completed",
+                verification_status="unverified",
+                state_snapshot=self.state.snapshot(),
             )
+            results.append(step_res)
             step_idx += 1
         return results
 
@@ -297,6 +521,8 @@ class Executor:
         Queries Llama 3 to analyze the failed step and layout, and attempts to execute a repair action.
         Returns True if the repair succeeded and we can continue the plan.
         """
+        if self._is_cancelled():
+            return False
         print(f"[REPAIR] Step failed: {failed_step.get('tool')}. Error: {error_msg}")
 
         # 1. Capture screen and run UI detector

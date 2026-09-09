@@ -17,6 +17,7 @@ class ToolContext:
     dry_run: bool = False
     agent_base_url: str = "http://127.0.0.1:5000"
     workspace_root: Optional[str] = None
+    request_context: Optional[Any] = None
 
 
 class Tool(Protocol):

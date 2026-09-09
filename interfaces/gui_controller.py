@@ -223,7 +223,13 @@ class GuiController(QObject):
                     state.data["pending_app_path"] = chosen_candidate["path"]
                     state.data["pending_app_name"] = chosen_candidate["name"]
 
+                req_ctx = task_info.get("request_context")
+
                 def resume_task():
+                    if req_ctx:
+                        from core.lifecycle import set_current_request
+                        set_current_request(req_ctx)
+
                     self.status_changed.emit("Provadim...")
                     self.start_ai_bubble.emit()
 
@@ -238,6 +244,8 @@ class GuiController(QObject):
                             start_index=task_info["step_index"],
                             on_step_update=update_gui,
                             on_task_start=lambda task_goal, steps: self.task_started.emit(task_goal, steps),
+                            expected_request_id=task_info.get("request_id"),
+                            request_context=req_ctx,
                         )
                     except Exception as e:
                         summary = f"Neocekavana chyba pri provadeni ukolu: {e}"
@@ -251,6 +259,8 @@ class GuiController(QObject):
                                 "state": result.state,
                                 "step_index": result.state.data.get("paused_step_index", 0),
                                 "goal": result.goal,
+                                "request_id": result.request_id,
+                                "request_context": req_ctx,
                             }
 
                     self.chunk_received.emit(summary)
@@ -358,11 +368,14 @@ class GuiController(QObject):
         self.event_bus.emit("ai_request", message)
 
     def process_agent_request(self, parsed):
+        from core.lifecycle import reset_current_request, set_current_request
 
         self.clear_input.emit()
+        goal = parsed.original_text
+        req_ctx = reset_current_request(goal=goal, source="gui_agent")
 
         def agent_task():
-            goal = parsed.original_text
+            set_current_request(req_ctx)
             self.status_changed.emit("Provadim...")
 
             def update_gui(idx: int, status: str):
@@ -374,6 +387,7 @@ class GuiController(QObject):
                     on_step_update=update_gui,
                     on_task_start=lambda task_goal, steps: self.task_started.emit(task_goal, steps),
                     reset_request=False,
+                    request_context=req_ctx,
                 )
             except Exception as e:
                 summary = f"Neocekavana chyba pri provadeni ukolu: {e}"
@@ -411,6 +425,8 @@ class GuiController(QObject):
                     "state": result.state,
                     "step_index": result.state.data.get("paused_step_index", 0),
                     "goal": goal,
+                    "request_id": result.request_id,
+                    "request_context": req_ctx,
                 }
 
             self.chunk_received.emit(result.summary)
@@ -429,10 +445,14 @@ class GuiController(QObject):
         return t
 
     def process_ai_request(self, message: str):
+        from core.lifecycle import reset_current_request, set_current_request
+
         self.profile = update_profile(self.profile, message)
         save_json(PROFILE_FILE, self.profile)
         prompt = self.build_prompt(message)
         self.status_changed.emit("Premyslim...")
+
+        req_ctx = reset_current_request(goal=message, source="gui_chat")
 
         threading.Thread(
             target=speak,
@@ -443,6 +463,7 @@ class GuiController(QObject):
         chat_model = self.chats[self.current_chat]["model"]
 
         def ai_task():
+            set_current_request(req_ctx)
             self.start_ai_bubble.emit()
             response_generator = generate_stream(prompt, chat_model)
             buffer = ""
