@@ -228,6 +228,14 @@ class ScreenshotTool:
         if screenshot_path:
             out["created_files"] = [str(screenshot_path)]
             out["save_to_state"] = {"last_screenshot_path": str(screenshot_path)}
+            from core.observation import Observation, ObservationType
+            out["observation"] = Observation(
+                source="screenshot",
+                type=ObservationType.SCREEN,
+                data={"path": str(screenshot_path)},
+                confidence=1.0,
+                evidence={"path": str(screenshot_path)},
+            ).to_dict()
         return out
 
 
@@ -641,5 +649,317 @@ class RefreshAppsTool:
     def run(self, tool_input: JSON, ctx: ToolContext, state: Any) -> JSON:
         res = _post_agent(ctx, "refresh_apps")
         return _agent_tool_result(res)
+
+
+# ===========================================================================
+# Authoritative Deterministic Windows Process, Window, and Control Tools
+# ===========================================================================
+
+class LaunchApplicationTool(OpenAppTool):
+    name = "launch_application"
+    description = "Launch a Windows application by name or path."
+    capability = ToolCapability.LAUNCH_APPLICATION
+    risk = ActionRisk.LOW
+    timeout = 15.0
+
+
+class OpenUrlTool(OpenWebsiteTool):
+    name = "open_url"
+    description = "Open a valid web URL in the default web browser."
+    capability = ToolCapability.OPEN_URL
+    risk = ActionRisk.LOW
+    timeout = 10.0
+
+    def run(self, tool_input: JSON, ctx: ToolContext, state: Any) -> JSON:
+        url = str(tool_input.get("url", "")).strip()
+        if not url.lower().startswith(("http://", "https://")):
+            return {"ok": False, "error": f"Invalid URL scheme: only http:// and https:// are permitted, got '{url}'"}
+        return super().run(tool_input, ctx, state)
+
+
+class OpenPathTool:
+    name = "open_path"
+    description = "Open a file or application directly at a specific path."
+    capability = ToolCapability.PROCESS_START
+    risk = ActionRisk.HIGH
+    timeout = 15.0
+    input_schema: JSON = {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+    }
+
+    def run(self, tool_input: JSON, ctx: ToolContext, state: Any) -> JSON:
+        raw_path = str(tool_input.get("path") or tool_input.get("target") or "").strip()
+        if not raw_path:
+            return {"ok": False, "error": "Missing required parameter 'path'"}
+        from utils.path_utils import canonical_windows_path
+        path = canonical_windows_path(raw_path, workspace_root=ctx.workspace_root)
+        res = _post_agent(ctx, "open_path", path)
+        return _agent_tool_result(res)
+
+
+def _query_processes_windows() -> List[Dict[str, Any]]:
+    """Return list of running processes with Image Name, PID, Session Name, Memory."""
+    import subprocess
+    import os
+    startupinfo = None
+    if os.name == "nt":
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        startupinfo.wShowWindow = 0
+
+    try:
+        proc = subprocess.run(
+            ["tasklist", "/fo", "csv", "/nh"],
+            capture_output=True,
+            text=True,
+            timeout=4.0,
+            startupinfo=startupinfo,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if proc.returncode == 0:
+            results = []
+            for line in proc.stdout.strip().splitlines():
+                parts = [p.strip(' "') for p in line.split('","')]
+                if len(parts) >= 2:
+                    name = parts[0].strip(' "')
+                    pid_str = parts[1].strip(' "')
+                    try:
+                        pid = int(pid_str)
+                    except ValueError:
+                        pid = None
+                    mem = parts[4].strip(' "') if len(parts) > 4 else ""
+                    results.append({"name": name, "pid": pid, "memory": mem})
+            return results
+    except Exception:
+        pass
+    return []
+
+
+class ProcessExistsTool:
+    name = "process_exists"
+    description = "Deterministically check if a process is running by name or PID."
+    capability = ToolCapability.SYSTEM_QUERY
+    risk = ActionRisk.SAFE
+    timeout = 10.0
+    input_schema: JSON = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "pid": {"type": "integer"},
+            "process_name": {"type": "string"},
+        },
+    }
+
+    def run(self, tool_input: JSON, ctx: ToolContext, state: Any) -> JSON:
+        target_name = str(tool_input.get("process_name") or tool_input.get("name") or "").strip().lower()
+        pid = tool_input.get("pid")
+
+        if not target_name and pid is None:
+            return {"ok": False, "error": "Either 'name' or 'pid' must be specified."}
+
+        procs = _query_processes_windows()
+        matching = []
+        for p in procs:
+            if pid is not None and p.get("pid") == int(pid):
+                matching.append(p)
+            elif target_name and (p["name"].lower() == target_name or p["name"].lower() == f"{target_name}.exe"):
+                matching.append(p)
+
+        exists = len(matching) > 0
+        return {
+            "ok": True,
+            "exists": exists,
+            "target": target_name or pid,
+            "matching_count": len(matching),
+            "result": f"Process '{target_name or pid}' is {'running' if exists else 'not running'}.",
+            "matching_processes": matching[:5],
+        }
+
+
+class GetProcessInfoTool:
+    name = "get_process_info"
+    description = "Get detailed information about running processes matching a name or PID."
+    capability = ToolCapability.SYSTEM_QUERY
+    risk = ActionRisk.SAFE
+    timeout = 10.0
+    input_schema: JSON = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "pid": {"type": "integer"},
+            "process_name": {"type": "string"},
+        },
+    }
+
+    def run(self, tool_input: JSON, ctx: ToolContext, state: Any) -> JSON:
+        target_name = str(tool_input.get("process_name") or tool_input.get("name") or "").strip().lower()
+        pid = tool_input.get("pid")
+
+        procs = _query_processes_windows()
+        matching = []
+        for p in procs:
+            if pid is not None and p.get("pid") == int(pid):
+                matching.append(p)
+            elif target_name and (p["name"].lower() == target_name or p["name"].lower() == f"{target_name}.exe"):
+                matching.append(p)
+
+        return {
+            "ok": True,
+            "target": target_name or pid,
+            "count": len(matching),
+            "processes": matching,
+            "result": matching if matching else f"No process found for '{target_name or pid}'.",
+        }
+
+
+class TerminateProcessTool:
+    name = "terminate_process"
+    description = "Terminate a running Windows process by name or PID. Idempotent."
+    capability = ToolCapability.PROCESS_TERMINATE
+    risk = ActionRisk.HIGH
+    timeout = 10.0
+    input_schema: JSON = {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "pid": {"type": "integer"},
+            "process_name": {"type": "string"},
+        },
+    }
+
+    def run(self, tool_input: JSON, ctx: ToolContext, state: Any) -> JSON:
+        target_name = str(tool_input.get("process_name") or tool_input.get("name") or "").strip()
+        pid = tool_input.get("pid")
+
+        if not target_name and pid is None:
+            return {"ok": False, "error": "Either 'name' or 'pid' must be specified."}
+
+        # Idempotence pre-check: if process is not running, succeed immediately
+        procs = _query_processes_windows()
+        matching = []
+        for p in procs:
+            if pid is not None and p.get("pid") == int(pid):
+                matching.append(p)
+            elif target_name and (p["name"].lower() == target_name.lower() or p["name"].lower() == f"{target_name.lower()}.exe"):
+                matching.append(p)
+
+        if not matching:
+            return {
+                "ok": True,
+                "result": f"Process '{target_name or pid}' is not running (already terminated).",
+                "target": target_name or pid,
+                "already_terminated": True,
+            }
+
+        if ctx.dry_run:
+            return {"ok": True, "dry_run": True, "result": f"Would terminate process {target_name or pid}"}
+
+        import subprocess
+        import os
+        cmd = ["taskkill", "/F"]
+        if pid is not None:
+            cmd.extend(["/PID", str(pid)])
+        else:
+            exe_name = target_name if target_name.lower().endswith(".exe") else f"{target_name}.exe"
+            cmd.extend(["/IM", exe_name])
+
+        try:
+            startupinfo = None
+            if os.name == "nt":
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = 0
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=5.0,
+                startupinfo=startupinfo,
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+            return {
+                "ok": res.returncode == 0,
+                "result": res.stdout.strip() or res.stderr.strip() or f"Terminated {target_name or pid}",
+                "target": target_name or pid,
+            }
+        except Exception as e:
+            return {"ok": False, "error": f"Failed to terminate process: {e}", "target": target_name or pid}
+
+
+class WindowExistsTool:
+    name = "window_exists"
+    description = "Check if a visible window exists with title matching query."
+    capability = ToolCapability.SYSTEM_QUERY
+    risk = ActionRisk.SAFE
+    timeout = 10.0
+    input_schema: JSON = {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "window_title": {"type": "string"},
+            "target": {"type": "string"},
+        },
+    }
+
+    def run(self, tool_input: JSON, ctx: ToolContext, state: Any) -> JSON:
+        target = str(
+            tool_input.get("title")
+            or tool_input.get("window_title")
+            or tool_input.get("target")
+            or ""
+        ).strip().lower()
+
+        if not target:
+            return {"ok": False, "error": "Missing required parameter 'title'"}
+
+        from core.verification import _get_visible_window_titles_windows
+        titles = _get_visible_window_titles_windows()
+        matching = [t for t in titles if target in t.lower()]
+        return {
+            "ok": True,
+            "exists": len(matching) > 0,
+            "matching_windows": matching,
+            "result": f"Found {len(matching)} windows matching '{target}'" if matching else f"No window matching '{target}'",
+        }
+
+
+class DoubleClickTool:
+    name = "double_click"
+    description = "Perform a mouse double-click, optionally at x/y screen coordinates."
+    capability = ToolCapability.CLICK
+    risk = ActionRisk.LOW
+    timeout = 10.0
+    input_schema: JSON = {
+        "type": "object",
+        "properties": {
+            "x": {"type": "integer"},
+            "y": {"type": "integer"},
+            "button": {"type": "string"},
+        },
+    }
+
+    def run(self, tool_input: JSON, ctx: ToolContext, state: Any) -> JSON:
+        payload: Any
+        if "x" in tool_input and "y" in tool_input:
+            payload = {
+                "x": int(tool_input["x"]),
+                "y": int(tool_input["y"]),
+                "button": str(tool_input.get("button", "left")),
+                "clicks": 2,
+            }
+        else:
+            payload = {"clicks": 2}
+        return _agent_tool_result(_post_agent(ctx, "click", payload))
+
+
+class TypeTextTool(WriteTextTool):
+    name = "type_text"
+    description = "Type text on the screen using keyboard simulation."
+    capability = ToolCapability.TYPE_TEXT
+    risk = ActionRisk.LOW
+    timeout = 10.0
+
 
 

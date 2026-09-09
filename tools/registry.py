@@ -104,33 +104,59 @@ class ToolRegistry:
 
 def build_default_registry() -> ToolRegistry:
     """Create the standard Jarvis tool registry used by CLI, GUI, and voice."""
-    from tools.file_manager import ListDirTool, ReadTextFileTool, WriteTextFileTool
+    from tools.file_manager import (
+        CopyFileTool,
+        CreateDirectoryTool,
+        CreateFileTool,
+        DeleteDirectoryTool,
+        DeleteFileTool,
+        ListDirTool,
+        MoveFileTool,
+        ReadFileTool,
+        ReadTextFileTool,
+        WriteFileTool,
+        WriteTextFileTool,
+    )
     from tools.pc_control import (
         AgentHealthTool,
         CancelDialogTool,
         ClickTool,
         CloseWindowTool,
         ConfirmDialogTool,
+        DoubleClickTool,
+        GetProcessInfoTool,
         HotkeyTool,
+        LaunchApplicationTool,
         OpenAppTool,
+        OpenPathTool,
         OpenSearchResultTool,
+        OpenUrlTool,
         OpenWebsiteTool,
         PressKeyTool,
+        ProcessExistsTool,
         ReadScreenTool,
         RefreshAppsTool,
         ScreenshotTool,
         SmartCheckboxTool,
         SmartClickTool,
         SmartWriteTool,
+        TerminateProcessTool,
+        TypeTextTool,
+        WindowExistsTool,
         WriteTextTool,
     )
 
     reg = ToolRegistry()
     reg.register(AgentHealthTool())
     reg.register(OpenAppTool())
+    reg.register(LaunchApplicationTool())
     reg.register(WriteTextTool())
+    reg.register(TypeTextTool())
     reg.register(ClickTool())
+    reg.register(DoubleClickTool())
     reg.register(OpenWebsiteTool())
+    reg.register(OpenUrlTool())
+    reg.register(OpenPathTool())
     reg.register(PressKeyTool())
     reg.register(HotkeyTool())
     reg.register(ScreenshotTool())
@@ -142,9 +168,22 @@ def build_default_registry() -> ToolRegistry:
     reg.register(ConfirmDialogTool())
     reg.register(CancelDialogTool())
     reg.register(OpenSearchResultTool())
+    reg.register(ProcessExistsTool())
+    reg.register(GetProcessInfoTool())
+    reg.register(TerminateProcessTool())
+    reg.register(WindowExistsTool())
     reg.register(ListDirTool())
     reg.register(ReadTextFileTool())
+    reg.register(ReadFileTool())
     reg.register(WriteTextFileTool())
+    reg.register(WriteFileTool())
+    reg.register(CreateFileTool())
+    reg.register(CopyFileTool())
+    reg.register(MoveFileTool())
+    reg.register(DeleteFileTool())
+    reg.register(CreateDirectoryTool())
+    reg.register(DeleteDirectoryTool())
     reg.register(RefreshAppsTool())
     return reg
+
 

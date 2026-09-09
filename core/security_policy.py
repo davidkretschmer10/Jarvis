@@ -107,17 +107,18 @@ def classify_path_scope(path_str: str) -> ResourceScope:
     if raw_path.startswith(("http://", "https://")):
         return ResourceScope.NETWORK_URL
 
-    try:
-        resolved = Path(raw_path).expanduser().resolve()
-        resolved_str = str(resolved).lower()
-    except Exception:
+    from utils.path_utils import canonical_windows_path
+    can_path = canonical_windows_path(raw_path)
+    if not can_path:
         return ResourceScope.UNKNOWN
+    resolved_str = can_path.lower()
+    resolved = Path(can_path)
 
     # System roots & protected locations
-    windir = os.environ.get("WINDIR", r"C:\Windows").lower()
-    prog_files = os.environ.get("ProgramFiles", r"C:\Program Files").lower()
-    prog_files_x86 = os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)").lower()
-    prog_data = os.environ.get("ProgramData", r"C:\ProgramData").lower()
+    windir = canonical_windows_path(os.environ.get("WINDIR", r"C:\Windows")).lower()
+    prog_files = canonical_windows_path(os.environ.get("ProgramFiles", r"C:\Program Files")).lower()
+    prog_files_x86 = canonical_windows_path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")).lower()
+    prog_data = canonical_windows_path(os.environ.get("ProgramData", r"C:\ProgramData")).lower()
 
     # Check for drive root (e.g. C:\, D:\)
     if len(resolved.parts) <= 1:
@@ -129,26 +130,26 @@ def classify_path_scope(path_str: str) -> ResourceScope:
             return ResourceScope.SYSTEM_PROTECTED
 
     # Temporary paths
-    temp_dir = os.environ.get("TEMP", "").lower()
-    tmp_dir = os.environ.get("TMP", "").lower()
+    temp_dir = canonical_windows_path(os.environ.get("TEMP", "")).lower()
+    tmp_dir = canonical_windows_path(os.environ.get("TMP", "")).lower()
     import tempfile
-    sys_temp = tempfile.gettempdir().lower()
+    sys_temp = canonical_windows_path(tempfile.gettempdir()).lower()
     for t_dir in (temp_dir, tmp_dir, sys_temp):
         if t_dir and (resolved_str == t_dir or resolved_str.startswith(t_dir + os.sep)):
             return ResourceScope.TEMPORARY
 
     # AppData
-    appdata = os.environ.get("APPDATA", "").lower()
-    localappdata = os.environ.get("LOCALAPPDATA", "").lower()
+    appdata = canonical_windows_path(os.environ.get("APPDATA", "")).lower()
+    localappdata = canonical_windows_path(os.environ.get("LOCALAPPDATA", "")).lower()
     for a_dir in (appdata, localappdata):
         if a_dir and (resolved_str == a_dir or resolved_str.startswith(a_dir + os.sep)):
             return ResourceScope.APP_DATA
 
     # User Home & Documents
-    userprofile = os.environ.get("USERPROFILE", "").lower()
+    userprofile = canonical_windows_path(os.environ.get("USERPROFILE", "")).lower()
     if userprofile and (resolved_str == userprofile or resolved_str.startswith(userprofile + os.sep)):
         # Check if it's current workspace
-        workspace = str(Path.cwd().resolve()).lower()
+        workspace = canonical_windows_path(str(Path.cwd())).lower()
         if resolved_str == workspace or resolved_str.startswith(workspace + os.sep):
             return ResourceScope.USER_WORKSPACE
         return ResourceScope.USER_DOCUMENTS
@@ -217,7 +218,19 @@ class SecurityPolicy:
         "smart_checkbox": ToolCapability.UI_CLICK,
         "press_key": ToolCapability.PRESS_KEY,
         "hotkey": ToolCapability.PRESS_KEY,
-        "execute_code": ToolCapability.SHELL_COMMAND,
+        "launch_application": ToolCapability.LAUNCH_APPLICATION,
+        "open_url": ToolCapability.OPEN_URL,
+        "open_path": ToolCapability.PROCESS_START,
+        "create_file": ToolCapability.CREATE_FILE,
+        "copy_file": ToolCapability.CREATE_FILE,
+        "move_file": ToolCapability.MODIFY_FILE,
+        "create_directory": ToolCapability.CREATE_DIRECTORY,
+        "delete_directory": ToolCapability.DELETE_DIRECTORY,
+        "process_exists": ToolCapability.SYSTEM_QUERY,
+        "get_process_info": ToolCapability.SYSTEM_QUERY,
+        "terminate_process": ToolCapability.PROCESS_TERMINATE,
+        "window_exists": ToolCapability.SYSTEM_QUERY,
+        "double_click": ToolCapability.CLICK,
         # Unit test dummy/fixture tools
         "test_tool": ToolCapability.SYSTEM_QUERY,
         "dummy_tool": ToolCapability.SYSTEM_QUERY,
@@ -245,18 +258,29 @@ class SecurityPolicy:
         "screenshot": ActionRisk.SAFE,
         "read_screen": ActionRisk.SAFE,
         "open_app": ActionRisk.LOW,
+        "launch_application": ActionRisk.LOW,
         "browse_web": ActionRisk.LOW,
         "open_website": ActionRisk.LOW,
+        "open_url": ActionRisk.LOW,
+        "open_path": ActionRisk.HIGH,
         "click": ActionRisk.LOW,
+        "double_click": ActionRisk.LOW,
         "write_text": ActionRisk.LOW,
         "type_text": ActionRisk.LOW,
         "press_key": ActionRisk.LOW,
         "hotkey": ActionRisk.LOW,
         "cancel_dialog": ActionRisk.LOW,
         "open_search_result": ActionRisk.LOW,
+        "process_exists": ActionRisk.SAFE,
+        "get_process_info": ActionRisk.SAFE,
+        "window_exists": ActionRisk.SAFE,
+        "copy_file": ActionRisk.LOW,
+        "create_directory": ActionRisk.LOW,
         "write_note": ActionRisk.MEDIUM,
         "write_file": ActionRisk.MEDIUM,
         "write_text_file": ActionRisk.MEDIUM,
+        "create_file": ActionRisk.MEDIUM,
+        "move_file": ActionRisk.MEDIUM,
         "click_element": ActionRisk.MEDIUM,
         "smart_click": ActionRisk.MEDIUM,
         "smart_write": ActionRisk.MEDIUM,
@@ -265,6 +289,8 @@ class SecurityPolicy:
         "close_window": ActionRisk.HIGH,
         "confirm_dialog": ActionRisk.HIGH,
         "delete_file": ActionRisk.HIGH,
+        "delete_directory": ActionRisk.HIGH,
+        "terminate_process": ActionRisk.HIGH,
         "execute_code": ActionRisk.HIGH,
         # Unit test dummy/fixture tools
         "test_tool": ActionRisk.SAFE,
@@ -276,6 +302,18 @@ class SecurityPolicy:
         "recovery_tool": ActionRisk.SAFE,
         "bad_tool": ActionRisk.SAFE,
         "tool_run": ActionRisk.SAFE,
+    }
+
+    # Protected system processes that can NEVER be terminated
+    PROTECTED_PROCESS_NAMES = {
+        "csrss.exe",
+        "lsass.exe",
+        "smss.exe",
+        "services.exe",
+        "wininit.exe",
+        "winlogon.exe",
+        "system",
+        "svchost.exe",
     }
 
     # Dangerous commands or files that are unconditionally CRITICAL / DENY
@@ -378,6 +416,27 @@ class SecurityPolicy:
                         reason=f"Shell command contains prohibited pattern: {pattern}",
                         target_resource=target_resource or cmd_str,
                     )
+
+        # 6b. Check for Protected Process Termination
+        if capability == ToolCapability.PROCESS_TERMINATE:
+            target_proc = ""
+            if isinstance(tool_input, dict):
+                target_proc = str(
+                    tool_input.get("process_name")
+                    or tool_input.get("name")
+                    or tool_input.get("app")
+                    or tool_input.get("target")
+                    or ""
+                ).lower().strip()
+            if target_proc in self.PROTECTED_PROCESS_NAMES or (target_proc + ".exe") in self.PROTECTED_PROCESS_NAMES:
+                return PolicyEvaluationResult(
+                    decision=PolicyDecision.DENY,
+                    risk=ActionRisk.CRITICAL,
+                    capability=capability,
+                    resource_scope=ResourceScope.SYSTEM_PROTECTED,
+                    reason=f"Terminating critical system process '{target_proc}' is strictly prohibited.",
+                    target_resource=target_proc,
+                )
 
         # 7. Check for System-Protected resources
         if resource_scope == ResourceScope.SYSTEM_PROTECTED:
@@ -492,7 +551,11 @@ class SecurityPolicy:
         """Extract path, URL, process name, or target resource from tool input."""
         if not isinstance(tool_input, dict):
             return None
-        for key in ("filepath", "file_path", "path", "filename", "file", "target", "target_path", "url", "app_name", "window_title", "directory", "dir"):
+        for key in (
+            "destination", "dest", "filepath", "file_path", "path", "filename", "file",
+            "source", "target", "target_path", "url", "app_name", "process_name", "name",
+            "window_title", "directory", "dir"
+        ):
             val = tool_input.get(key)
             if val and isinstance(val, str):
                 return val

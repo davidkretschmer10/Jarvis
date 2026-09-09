@@ -352,7 +352,7 @@ class Executor:
                 if cm:
                     conf = cm.get_confirmation(req_id, step_number, tool_name)
 
-                if conf and conf.is_approved:
+                if (conf and conf.is_approved) or (not cm and self.state.data.get("action_authorized")):
                     confirmation_status_str = "APPROVED"
                     self.state.data["action_authorized"] = True
                 elif conf and conf.is_expired:
@@ -469,6 +469,26 @@ class Executor:
                 if self._is_cancelled():
                     cancelled_during_run = True
                     break
+
+                # Pre-retry observation check for destructive operations (idempotence guard)
+                if attempt > 0 and eval_res.capability in (
+                    ToolCapability.DELETE_FILE,
+                    ToolCapability.DELETE_DIRECTORY,
+                    ToolCapability.PROCESS_TERMINATE,
+                ):
+                    if self.verifier is None:
+                        self.verifier = StepVerifierRegistry()
+                    pre_check_vr = self.verifier.verify_step(
+                        step, {"ok": True}, state=self.state, ctx=self.request_context
+                    )
+                    if pre_check_vr.is_verified():
+                        print(f"[EXECUTOR] Destructive action '{tool_name}' already achieved expected state before retry {attempt+1}. Skipping redundant execution.")
+                        out = {
+                            "ok": True,
+                            "result": "Action already achieved expected state (verified).",
+                            "already_achieved": True,
+                        }
+                        break
 
                 out = self.registry.run(tool_name, tool_input, self.ctx, self.state)
                 if out.get("ok", False):

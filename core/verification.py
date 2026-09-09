@@ -284,7 +284,10 @@ class FileVerifier(BaseVerifier):
         tool = (step.get("tool") or "").lower()
         return tool in {
             "write_file",
+            "write_text_file",
             "create_file",
+            "copy_file",
+            "move_file",
             "delete_file",
             "remove_file",
             "append_file",
@@ -298,8 +301,75 @@ class FileVerifier(BaseVerifier):
         state: Optional[Dict[str, Any]] = None,
         ctx: Optional[Any] = None,
     ) -> VerificationResult:
-        args = step.get("args") or {}
+        args = step.get("args") or step.get("input") or {}
         tool = (step.get("tool") or "").lower()
+
+        # Handle Copy File verification
+        if tool in {"copy_file", "copy"}:
+            src = args.get("source") or args.get("src") or ""
+            dst = args.get("destination") or args.get("dst") or ""
+            if not src or not dst:
+                return VerificationResult(
+                    status=VerificationStatus.UNKNOWN,
+                    verifier="FileVerifier",
+                    expected="Source and destination file paths",
+                    observed=f"src='{src}', dst='{dst}'",
+                    message="Cannot verify copy without source and destination paths",
+                )
+            src_exists = os.path.isfile(src)
+            dst_exists = os.path.isfile(dst)
+            if src_exists and dst_exists and os.path.getsize(src) == os.path.getsize(dst):
+                return VerificationResult(
+                    status=VerificationStatus.VERIFIED,
+                    verifier="FileVerifier",
+                    expected=f"Destination '{dst}' exists with size matching source '{src}'",
+                    observed=f"Source ({os.path.getsize(src)} bytes) and destination match",
+                    evidence={"source": src, "destination": dst, "size": os.path.getsize(dst)},
+                    message=f"File successfully copied from '{src}' to '{dst}'",
+                )
+            else:
+                return VerificationResult(
+                    status=VerificationStatus.FAILED,
+                    verifier="FileVerifier",
+                    expected=f"Destination '{dst}' created with matching size",
+                    observed=f"src_exists={src_exists}, dst_exists={dst_exists}",
+                    evidence={"src_exists": src_exists, "dst_exists": dst_exists},
+                    message=f"Copy verification failed: source exists={src_exists}, destination exists={dst_exists}",
+                )
+
+        # Handle Move File verification
+        if tool in {"move_file", "move"}:
+            src = args.get("source") or args.get("src") or ""
+            dst = args.get("destination") or args.get("dst") or ""
+            if not src or not dst:
+                return VerificationResult(
+                    status=VerificationStatus.UNKNOWN,
+                    verifier="FileVerifier",
+                    expected="Source and destination file paths",
+                    observed=f"src='{src}', dst='{dst}'",
+                    message="Cannot verify move without source and destination paths",
+                )
+            src_exists = os.path.exists(src)
+            dst_exists = os.path.exists(dst)
+            if not src_exists and dst_exists:
+                return VerificationResult(
+                    status=VerificationStatus.VERIFIED,
+                    verifier="FileVerifier",
+                    expected=f"Source '{src}' absent and destination '{dst}' present",
+                    observed="Source gone, destination exists",
+                    evidence={"source": src, "destination": dst},
+                    message=f"File successfully moved from '{src}' to '{dst}'",
+                )
+            else:
+                return VerificationResult(
+                    status=VerificationStatus.FAILED,
+                    verifier="FileVerifier",
+                    expected=f"Source '{src}' absent and destination '{dst}' present",
+                    observed=f"src_still_exists={src_exists}, dst_exists={dst_exists}",
+                    evidence={"src_still_exists": src_exists, "dst_exists": dst_exists},
+                    message=f"Move verification failed: source still exists={src_exists}, destination exists={dst_exists}",
+                )
+
         file_path = (
             args.get("file_path")
             or args.get("path")
@@ -609,6 +679,208 @@ class UIInteractionVerifier(BaseVerifier):
 
 
 # ---------------------------------------------------------------------------
+# Process Verifier
+# ---------------------------------------------------------------------------
+
+class ProcessVerifier(BaseVerifier):
+    """
+    Verifies process existence, start, and termination deterministically.
+    """
+
+    def can_verify(self, step: Dict[str, Any], tool_output: Dict[str, Any]) -> bool:
+        tool = (step.get("tool") or "").lower()
+        return tool in {
+            "process_exists",
+            "terminate_process",
+            "kill_process",
+            "get_process_info",
+        }
+
+    def verify(
+        self,
+        step: Dict[str, Any],
+        tool_output: Dict[str, Any],
+        state: Optional[Dict[str, Any]] = None,
+        ctx: Optional[Any] = None,
+    ) -> VerificationResult:
+        args = step.get("args") or step.get("input") or {}
+        tool = (step.get("tool") or "").lower()
+        target = str(args.get("process_name") or args.get("name") or "").strip().lower()
+        pid = args.get("pid")
+
+        active_procs = _get_running_processes_windows()
+        is_terminate = "terminate" in tool or "kill" in tool
+
+        # Helper to check if PID is active
+        def _check_pid_active(p_val: Any) -> bool:
+            if p_val is None:
+                return False
+            try:
+                import ctypes
+                kernel32 = ctypes.windll.kernel32
+                PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                STILL_ACTIVE = 259
+                h_proc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(p_val))
+                if h_proc:
+                    exit_code = ctypes.c_ulong()
+                    kernel32.GetExitCodeProcess(h_proc, ctypes.byref(exit_code))
+                    kernel32.CloseHandle(h_proc)
+                    return exit_code.value == STILL_ACTIVE
+            except Exception:
+                pass
+            try:
+                from tools.pc_control import _query_processes_windows
+                return any(p.get("pid") == int(p_val) for p in _query_processes_windows())
+            except Exception:
+                return False
+
+        if is_terminate:
+            target_running = False
+            if pid is not None:
+                target_running = _check_pid_active(pid)
+            elif target:
+                clean_target = target if target.endswith(".exe") else f"{target}.exe"
+                if clean_target in active_procs or target in active_procs:
+                    target_running = True
+
+            if not target_running:
+                return VerificationResult(
+                    status=VerificationStatus.VERIFIED,
+                    verifier="ProcessVerifier",
+                    expected=f"Process '{target or pid}' terminated and absent",
+                    observed="Process not found in system process table",
+                    evidence={"target": target or pid, "running": False},
+                    message=f"Process '{target or pid}' verified terminated",
+                )
+            else:
+                return VerificationResult(
+                    status=VerificationStatus.FAILED,
+                    verifier="ProcessVerifier",
+                    expected=f"Process '{target or pid}' terminated",
+                    observed="Process is still present in system process table",
+                    evidence={"target": target or pid, "running": True},
+                    message=f"Process '{target or pid}' is still running after termination",
+                )
+
+        # For process_exists or get_process_info:
+        if pid is not None:
+            actually_exists = _check_pid_active(pid)
+        elif target:
+            clean_target = target if target.endswith(".exe") else f"{target}.exe"
+            actually_exists = (bool(clean_target) and clean_target in active_procs) or (bool(target) and target in active_procs)
+        else:
+            actually_exists = False
+
+        reported_exists = tool_output.get("exists", actually_exists)
+
+        if reported_exists == actually_exists:
+            return VerificationResult(
+                status=VerificationStatus.VERIFIED,
+                verifier="ProcessVerifier",
+                expected=f"Process query for '{target or pid}' matches system state",
+                observed=f"exists={actually_exists}",
+                evidence={"target": target or pid, "exists": actually_exists},
+                message=f"Process state verified (exists={actually_exists})",
+            )
+        else:
+            return VerificationResult(
+                status=VerificationStatus.FAILED,
+                verifier="ProcessVerifier",
+                expected=f"Process query for '{target or pid}' matches system state",
+                observed=f"reported={reported_exists}, actual={actually_exists}",
+                evidence={"reported": reported_exists, "actual": actually_exists},
+                message=f"Process state mismatch for '{target or pid}'",
+            )
+
+
+# ---------------------------------------------------------------------------
+# Window Verifier
+# ---------------------------------------------------------------------------
+
+class WindowVerifier(BaseVerifier):
+    """
+    Verifies window existence and closing deterministically using visible window titles.
+    """
+
+    def can_verify(self, step: Dict[str, Any], tool_output: Dict[str, Any]) -> bool:
+        tool = (step.get("tool") or "").lower()
+        return tool in {"window_exists", "close_window"} or ("window" in tool and "ui" not in tool)
+
+    def verify(
+        self,
+        step: Dict[str, Any],
+        tool_output: Dict[str, Any],
+        state: Optional[Dict[str, Any]] = None,
+        ctx: Optional[Any] = None,
+    ) -> VerificationResult:
+        args = step.get("args") or step.get("input") or {}
+        tool = (step.get("tool") or "").lower()
+        target = str(
+            args.get("title")
+            or args.get("window_title")
+            or args.get("target")
+            or ""
+        ).strip().lower()
+
+        visible_windows = _get_visible_window_titles_windows()
+        is_close = "close" in tool
+
+        if is_close:
+            if not target:
+                return VerificationResult(
+                    status=VerificationStatus.UNKNOWN,
+                    verifier="WindowVerifier",
+                    expected="Target window title for deterministic verification",
+                    observed="Generic window close executed without target title",
+                    message="Active window closed, but specific window title verification is UNKNOWN",
+                )
+
+            found = [w for w in visible_windows if target in w.lower()]
+            if not found:
+                return VerificationResult(
+                    status=VerificationStatus.VERIFIED,
+                    verifier="WindowVerifier",
+                    expected=f"Window matching '{target}' absent",
+                    observed="No matching visible window found",
+                    evidence={"target": target, "still_visible": False},
+                    message=f"Window '{target}' verified closed",
+                )
+            else:
+                return VerificationResult(
+                    status=VerificationStatus.FAILED,
+                    verifier="WindowVerifier",
+                    expected=f"Window matching '{target}' absent",
+                    observed=f"Window still visible: {found}",
+                    evidence={"target": target, "found": found},
+                    message=f"Window '{target}' still visible after close action",
+                )
+
+        # window_exists tool
+        found = [w for w in visible_windows if target in w.lower()] if target else []
+        actually_exists = len(found) > 0
+        reported_exists = tool_output.get("exists", actually_exists)
+
+        if reported_exists == actually_exists:
+            return VerificationResult(
+                status=VerificationStatus.VERIFIED,
+                verifier="WindowVerifier",
+                expected=f"Window query '{target}' matches system state",
+                observed=f"exists={actually_exists}, matching={found}",
+                evidence={"target": target, "matching": found},
+                message=f"Window state verified (exists={actually_exists})",
+            )
+        else:
+            return VerificationResult(
+                status=VerificationStatus.FAILED,
+                verifier="WindowVerifier",
+                expected=f"Window query '{target}' matches system state",
+                observed=f"reported={reported_exists}, actual={actually_exists}",
+                evidence={"reported": reported_exists, "actual": actually_exists},
+                message=f"Window state mismatch for '{target}'",
+            )
+
+
+# ---------------------------------------------------------------------------
 # Pass-Through / Informational Verifier
 # ---------------------------------------------------------------------------
 
@@ -623,12 +895,16 @@ class PassThroughVerifier(BaseVerifier):
         "get_time",
         "memory_query",
         "read_file",
+        "read_text_file",
         "view_file",
         "list_directory",
         "list_dir",
         "search_web",
         "web_search",
         "echo",
+        "agent_health",
+        "refresh_apps",
+        "get_process_info",
     }
 
     def can_verify(self, step: Dict[str, Any], tool_output: Dict[str, Any]) -> bool:
@@ -664,11 +940,13 @@ class StepVerifierRegistry:
 
     def __init__(self, verifiers: Optional[List[BaseVerifier]] = None):
         if verifiers is None:
-            # Order: PassThrough/Read-only -> File -> Directory -> App -> Browser -> UI
+            # Order: PassThrough/Read-only -> File -> Directory -> Process -> Window -> App -> Browser -> UI
             self.verifiers: List[BaseVerifier] = [
                 PassThroughVerifier(),
                 FileVerifier(),
                 DirectoryVerifier(),
+                ProcessVerifier(),
+                WindowVerifier(),
                 ApplicationVerifier(),
                 BrowserVerifier(),
                 UIInteractionVerifier(),
