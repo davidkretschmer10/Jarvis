@@ -301,6 +301,9 @@ class GuiController(QObject):
                 self.clear_input.emit()
                 return
             else:
+                req_id = task_info.get("request_id")
+                if hasattr(self.runtime, "cancel_task"):
+                    self.runtime.cancel_task(request_id=req_id, reason="User denied confirmation")
                 self.paused_task = None
                 cancel_msg = "Úkol byl zrušen."
                 self.chunk_received.emit(cancel_msg)

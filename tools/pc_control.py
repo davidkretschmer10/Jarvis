@@ -37,16 +37,19 @@ def _get_agent_health(ctx: ToolContext) -> JSON:
     return {"ok": r.ok, "status_code": r.status_code, "data": data}
 
 
+from core.security_policy import ActionRisk, ToolCapability
+
+
 def _agent_tool_result(result: JSON) -> JSON:
     return {"ok": bool(result.get("ok", False)), "result": result}
 
-class AgentHealthTool:
-    name = "agent_health"
-    description = "Check that the local PC-control Agent is running."
 
 class AgentHealthTool:
     name = "agent_health"
     description = "Check that the local PC-control Agent is running."
+    capability = ToolCapability.SYSTEM_QUERY
+    risk = ActionRisk.SAFE
+    timeout = 5.0
     input_schema: JSON = {"type": "object", "properties": {}}
 
     def run(self, tool_input: JSON, ctx: ToolContext, state: Any) -> JSON:
@@ -56,6 +59,9 @@ class AgentHealthTool:
 class OpenAppTool:
     name = "open_app"
     description = "Open a Windows application by name via local Agent."
+    capability = ToolCapability.LAUNCH_APPLICATION
+    risk = ActionRisk.LOW
+    timeout = 10.0
     input_schema: JSON = {
         "type": "object",
         "properties": {"name": {"type": "string"}},
@@ -102,6 +108,9 @@ class OpenAppTool:
 class WriteTextTool:
     name = "write_text"
     description = "Write text on the screen using keyboard simulation."
+    capability = ToolCapability.TYPE_TEXT
+    risk = ActionRisk.LOW
+    timeout = 10.0
     input_schema: JSON = {
         "type": "object",
         "properties": {"text": {"type": "string"}},
@@ -116,6 +125,9 @@ class WriteTextTool:
 class ClickTool:
     name = "click"
     description = "Perform a mouse click via local Agent, optionally at x/y screen coordinates."
+    capability = ToolCapability.CLICK
+    risk = ActionRisk.LOW
+    timeout = 10.0
     input_schema: JSON = {
         "type": "object",
         "properties": {
@@ -143,6 +155,9 @@ class ClickTool:
 class OpenWebsiteTool:
     name = "open_website"
     description = "Open a URL in the default browser via local Agent."
+    capability = ToolCapability.OPEN_URL
+    risk = ActionRisk.LOW
+    timeout = 10.0
     input_schema: JSON = {
         "type": "object",
         "properties": {"url": {"type": "string"}},
@@ -157,6 +172,9 @@ class OpenWebsiteTool:
 class PressKeyTool:
     name = "press_key"
     description = "Press one keyboard key via local Agent."
+    capability = ToolCapability.PRESS_KEY
+    risk = ActionRisk.LOW
+    timeout = 5.0
     input_schema: JSON = {
         "type": "object",
         "properties": {"key": {"type": "string"}},
@@ -170,6 +188,9 @@ class PressKeyTool:
 class HotkeyTool:
     name = "hotkey"
     description = "Press a keyboard shortcut via local Agent, for example ctrl+l."
+    capability = ToolCapability.PRESS_KEY
+    risk = ActionRisk.LOW
+    timeout = 5.0
     input_schema: JSON = {
         "type": "object",
         "properties": {"keys": {"type": "array", "items": {"type": "string"}}},
@@ -186,6 +207,9 @@ class HotkeyTool:
 class ScreenshotTool:
     name = "screenshot"
     description = "Take a screenshot via local Agent and save it to a screenshots folder."
+    capability = ToolCapability.SCREEN_OBSERVATION
+    risk = ActionRisk.SAFE
+    timeout = 10.0
     input_schema: JSON = {
         "type": "object",
         "properties": {"folder": {"type": "string"}},
@@ -210,6 +234,9 @@ class ScreenshotTool:
 class ReadScreenTool:
     name = "read_screen"
     description = "Read visible screen text with OCR via local Agent."
+    capability = ToolCapability.SCREEN_OBSERVATION
+    risk = ActionRisk.SAFE
+    timeout = 15.0
     input_schema: JSON = {
         "type": "object",
         "properties": {"lang": {"type": "string"}},
@@ -233,6 +260,9 @@ class ReadScreenTool:
 class SmartClickTool:
     name = "smart_click"
     description = "Click on a button, menu item, link, or element matching the target text on screen."
+    capability = ToolCapability.UI_CLICK
+    risk = ActionRisk.MEDIUM
+    timeout = 15.0
     input_schema: JSON = {
         "type": "object",
         "properties": {
@@ -270,24 +300,26 @@ class SmartClickTool:
                 
         if ambiguous:
             options = [best_el.text] + [el.text for el in ambiguous]
-            if not state.data.get("action_confirmed"):
+            if not state.data.get("action_confirmed") and not state.data.get("action_authorized"):
                 return {
                     "ok": False,
                     "error": "CONFIRMATION_REQUIRED",
                     "message": f"Nalezl jsem více prvků s podobným názvem: {', '.join(options)}. Přejete si přesto pokračovat s prvkem '{best_el.text}'?"
                 }
-            state.data["action_confirmed"] = False
+            if not state.data.get("action_authorized"):
+                state.data["action_confirmed"] = False
             
         # Confidence score check
         confidence = best_el.confidence
         if confidence < 0.70:
-            if not state.data.get("action_confirmed"):
+            if not state.data.get("action_confirmed") and not state.data.get("action_authorized"):
                 return {
                     "ok": False,
                     "error": "CONFIRMATION_REQUIRED",
                     "message": f"Nízká spolehlivost ({confidence:.2f}) pro prvek '{best_el.text}'. Přejete si přesto pokračovat?"
                 }
-            state.data["action_confirmed"] = False
+            if not state.data.get("action_authorized"):
+                state.data["action_confirmed"] = False
         elif confidence < 0.90:
             import logging
             logging.getLogger(__name__).warning(f"Varování: Nízká spolehlivost ({confidence:.2f}) pro prvek '{best_el.text}'.")
@@ -310,6 +342,9 @@ class SmartClickTool:
 class SmartWriteTool:
     name = "smart_write"
     description = "Type text into an input field matching a target label."
+    capability = ToolCapability.TYPE_TEXT
+    risk = ActionRisk.MEDIUM
+    timeout = 15.0
     input_schema: JSON = {
         "type": "object",
         "properties": {
@@ -358,13 +393,14 @@ class SmartWriteTool:
         # Confidence score check
         confidence = best_el.confidence
         if confidence < 0.70:
-            if not state.data.get("action_confirmed"):
+            if not state.data.get("action_confirmed") and not state.data.get("action_authorized"):
                 return {
                     "ok": False,
                     "error": "CONFIRMATION_REQUIRED",
                     "message": f"Nízká spolehlivost ({confidence:.2f}) pro prvek '{best_el.text}'. Přejete si přesto pokračovat?"
                 }
-            state.data["action_confirmed"] = False
+            if not state.data.get("action_authorized"):
+                state.data["action_confirmed"] = False
         elif confidence < 0.90:
             import logging
             logging.getLogger(__name__).warning(f"Varování: Nízká spolehlivost ({confidence:.2f}) pro prvek '{best_el.text}'.")
@@ -386,6 +422,9 @@ class SmartWriteTool:
 class SmartCheckboxTool:
     name = "smart_checkbox"
     description = "Check or uncheck a checkbox matching a target label."
+    capability = ToolCapability.UI_CLICK
+    risk = ActionRisk.MEDIUM
+    timeout = 15.0
     input_schema: JSON = {
         "type": "object",
         "properties": {
@@ -418,13 +457,14 @@ class SmartCheckboxTool:
         # Confidence score check
         confidence = best_el.confidence
         if confidence < 0.70:
-            if not state.data.get("action_confirmed"):
+            if not state.data.get("action_confirmed") and not state.data.get("action_authorized"):
                 return {
                     "ok": False,
                     "error": "CONFIRMATION_REQUIRED",
                     "message": f"Nízká spolehlivost ({confidence:.2f}) pro prvek '{best_el.text}'. Přejete si přesto pokračovat?"
                 }
-            state.data["action_confirmed"] = False
+            if not state.data.get("action_authorized"):
+                state.data["action_confirmed"] = False
         elif confidence < 0.90:
             import logging
             logging.getLogger(__name__).warning(f"Varování: Nízká spolehlivost ({confidence:.2f}) pro prvek '{best_el.text}'.")
@@ -441,16 +481,20 @@ class SmartCheckboxTool:
 class CloseWindowTool:
     name = "close_window"
     description = "Close the currently active window."
+    capability = ToolCapability.PROCESS_TERMINATE
+    risk = ActionRisk.HIGH
+    timeout = 10.0
     input_schema: JSON = {"type": "object", "properties": {}}
 
     def run(self, tool_input: JSON, ctx: ToolContext, state: Any) -> JSON:
-        if not state.data.get("action_confirmed"):
+        if not state.data.get("action_confirmed") and not state.data.get("action_authorized"):
             return {
                 "ok": False,
                 "error": "CONFIRMATION_REQUIRED",
                 "message": "Detekoval jsem rizikovou akci: zavření okna. Přejete si přesto pokračovat?"
             }
-        state.data["action_confirmed"] = False
+        if not state.data.get("action_authorized"):
+            state.data["action_confirmed"] = False
         res = _post_agent(ctx, "hotkey", ["alt", "f4"])
         return {
             "ok": res.get("ok", False),
@@ -461,16 +505,20 @@ class CloseWindowTool:
 class ConfirmDialogTool:
     name = "confirm_dialog"
     description = "Confirm the currently active dialog window (e.g. click OK, Yes, Save, Potvrdit)."
+    capability = ToolCapability.UI_CLICK
+    risk = ActionRisk.HIGH
+    timeout = 15.0
     input_schema: JSON = {"type": "object", "properties": {}}
 
     def run(self, tool_input: JSON, ctx: ToolContext, state: Any) -> JSON:
-        if not state.data.get("action_confirmed"):
+        if not state.data.get("action_confirmed") and not state.data.get("action_authorized"):
             return {
                 "ok": False,
                 "error": "CONFIRMATION_REQUIRED",
                 "message": "Detekoval jsem rizikovou akci: kliknutí na potvrzovací tlačítko dialogu. Přejete si přesto pokračovat?"
             }
-        state.data["action_confirmed"] = False
+        if not state.data.get("action_authorized"):
+            state.data["action_confirmed"] = False
         
         from vision.ui_detector import UIDetector
         detector = UIDetector()
@@ -503,6 +551,9 @@ class ConfirmDialogTool:
 class CancelDialogTool:
     name = "cancel_dialog"
     description = "Cancel the currently active dialog window (e.g. click Cancel, No, Storno, Zrusit, Zavrit)."
+    capability = ToolCapability.UI_CLICK
+    risk = ActionRisk.LOW
+    timeout = 10.0
     input_schema: JSON = {"type": "object", "properties": {}}
 
     def run(self, tool_input: JSON, ctx: ToolContext, state: Any) -> JSON:
@@ -537,6 +588,9 @@ class CancelDialogTool:
 class OpenSearchResultTool:
     name = "open_search_result"
     description = "Open the first search result on screen."
+    capability = ToolCapability.UI_CLICK
+    risk = ActionRisk.LOW
+    timeout = 10.0
     input_schema: JSON = {"type": "object", "properties": {}}
 
     def run(self, tool_input: JSON, ctx: ToolContext, state: Any) -> JSON:
@@ -579,6 +633,9 @@ def fuzzy_match(query: str, text: str) -> float:
 class RefreshAppsTool:
     name = "refresh_apps"
     description = "Rebuild the applications cache and scan for installed apps."
+    capability = ToolCapability.SYSTEM_QUERY
+    risk = ActionRisk.SAFE
+    timeout = 10.0
     input_schema: JSON = {"type": "object", "properties": {}}
 
     def run(self, tool_input: JSON, ctx: ToolContext, state: Any) -> JSON:

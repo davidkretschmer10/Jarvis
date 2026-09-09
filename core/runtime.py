@@ -23,6 +23,9 @@ from core.state import JarvisState
 from core.task_memory import TaskMemory
 from tools.base import ToolContext
 from tools.registry import ToolRegistry, build_default_registry
+from core.security_policy import ActionRisk, PolicyDecision, ResourceScope, SecurityPolicy, ToolCapability
+from core.confirmation import ConfirmationManager, ConfirmationRequest, ConfirmationStatus
+from core.action_audit import ActionAuditLogger, get_audit_logger
 
 
 JSON = Dict[str, Any]
@@ -88,12 +91,25 @@ class JarvisRuntime:
         workspace_root: Optional[str] = None,
         dry_run: bool = False,
         event_bus: Any = None,
+        security_policy: Optional[SecurityPolicy] = None,
+        confirmation_manager: Optional[ConfirmationManager] = None,
+        audit_logger: Optional[ActionAuditLogger] = None,
     ) -> None:
         self.registry = registry or build_default_registry()
         self.agent_base_url = agent_base_url
         self.workspace_root = workspace_root or os.getcwd()
         self.dry_run = dry_run
         self.event_bus = event_bus
+        self.security_policy = security_policy or SecurityPolicy()
+        self.confirmation_manager = confirmation_manager or ConfirmationManager()
+        self.audit_logger = audit_logger or get_audit_logger()
+
+    def cancel_task(self, request_id: Optional[str] = None, reason: Optional[str] = None) -> None:
+        """Cancel current or specified request and invalidate any pending confirmation tokens."""
+        req_id = request_id or getattr(get_current_request(), "request_id", "")
+        if req_id and hasattr(self, "confirmation_manager"):
+            self.confirmation_manager.invalidate_request(req_id)
+        cancel_current_request(reason=reason, event_bus=self.event_bus)
 
     def run_task(
         self,
@@ -361,6 +377,9 @@ class JarvisRuntime:
             request_context=ctx if isinstance(ctx, RequestContext) else None,
             event_bus=self.event_bus,
             planner=planner_inst,
+            security_policy=self.security_policy,
+            confirmation_manager=self.confirmation_manager,
+            audit_logger=self.audit_logger,
         )
         results = executor.run_plan(steps)
 
@@ -450,6 +469,7 @@ class JarvisRuntime:
 
         # Invariant: Validate confirmation binding
         pending_conf = state.data.get("pending_confirmation")
+        req_id = expected_request_id or getattr(ctx, "request_id", "")
         if expected_request_id:
             if pending_conf and pending_conf.get("request_id") and pending_conf.get("request_id") != expected_request_id:
                 raise ValueError(
@@ -462,6 +482,33 @@ class JarvisRuntime:
                     f"but current context request_id is {getattr(ctx, 'request_id', '')}"
                 )
 
+        remaining_steps = steps[start_index:]
+        step_number = start_index + 1
+        tool_name = remaining_steps[0].get("tool") if remaining_steps else None
+        if not tool_name and pending_conf:
+            tool_name = pending_conf.get("tool")
+
+        # Authorize token in ConfirmationManager and check expiration
+        if tool_name and req_id:
+            conf = self.confirmation_manager.get_confirmation(req_id, step_number, tool_name)
+            if conf:
+                if conf.is_expired:
+                    raise ValueError(f"Confirmation for step {step_number} has expired.")
+                conf.approve()
+            else:
+                if pending_conf and pending_conf.get("expires_at"):
+                    if time.time() >= pending_conf["expires_at"]:
+                        raise ValueError(f"Confirmation for step {step_number} has expired.")
+                self.confirmation_manager.create_confirmation(
+                    request_id=req_id,
+                    step_id=step_number,
+                    tool=tool_name,
+                    capability=ToolCapability.UNKNOWN,
+                    risk=ActionRisk.HIGH,
+                    resource=None,
+                    summary="Approved via resume",
+                ).approve()
+
         if hasattr(ctx, "transition_to") and not getattr(ctx, "is_terminal", False):
             try:
                 ctx.transition_to(RequestStatus.EXECUTING, event_bus=self.event_bus, start_index=start_index)
@@ -469,11 +516,11 @@ class JarvisRuntime:
                 pass
 
         state.data["action_confirmed"] = True
+        state.data["action_authorized"] = True
         state.data.pop("user_help_required", None)
         state.data.pop("paused_step_index", None)
         state.data.pop("pending_confirmation", None)
 
-        remaining_steps = steps[start_index:]
         if on_task_start:
             on_task_start(
                 goal,
@@ -495,6 +542,9 @@ class JarvisRuntime:
             request_context=ctx if isinstance(ctx, RequestContext) else None,
             event_bus=self.event_bus,
             planner=planner_inst,
+            security_policy=self.security_policy,
+            confirmation_manager=self.confirmation_manager,
+            audit_logger=self.audit_logger,
         )
         results = executor.run_plan(remaining_steps)
 

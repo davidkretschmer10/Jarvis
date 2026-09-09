@@ -20,10 +20,16 @@ class ToolContext:
     request_context: Optional[Any] = None
 
 
+from core.security_policy import ActionRisk, ToolCapability
+
+
 class Tool(Protocol):
     name: str
     description: str
     input_schema: JSON  # lightweight JSON-schema-ish dict
+    capability: ToolCapability
+    risk: ActionRisk
+    timeout: float
 
     def run(self, tool_input: JSON, ctx: ToolContext, state: Any) -> JSON:
         ...

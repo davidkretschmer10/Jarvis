@@ -245,8 +245,26 @@ def run_task_endpoint():
     })
 
 
+def _verify_local_auth() -> tuple[bool, str]:
+    """Verify that HTTP request originates from local loopback and satisfies auth if configured."""
+    client_ip = request.remote_addr or ""
+    if client_ip not in ("127.0.0.1", "::1", "localhost"):
+        return False, "Access denied: Only local connections are permitted."
+
+    expected_token = os.environ.get("JARVIS_LOCAL_TOKEN")
+    if expected_token:
+        provided = request.headers.get("X-Jarvis-Token") or request.headers.get("Authorization", "").replace("Bearer ", "")
+        if provided != expected_token:
+            return False, "Unauthorized: Invalid or missing local authorization token."
+    return True, ""
+
+
 @app.route("/command", methods=["POST"])
 def command():
+    is_authed, auth_err = _verify_local_auth()
+    if not is_authed:
+        return jsonify({"ok": False, "error": auth_err}), 403
+
     data = request.get_json(silent=True) or {}
     action = (data.get("action") or "").strip()
     value = data.get("value", "")
@@ -263,14 +281,32 @@ def command():
         res = JarvisRuntime().run_task(str(value))
         return jsonify({"ok": res.ok, "result": res.summary, "steps": res.steps, "route": res.route})
 
-    if action == "refresh_apps":
-        load_scanned_apps(force=True)
-        result = {"apps_loaded": len(scanned_apps)}
-    elif action == "open":
-        result = open_program(value)
-    elif action == "open_path":
+    from core.security_policy import SecurityPolicy, ActionRisk, ToolCapability, PolicyDecision
+    from core.action_audit import get_audit_logger
+    policy = SecurityPolicy()
+    audit_logger = get_audit_logger()
+
+    if action == "open_path":
+        # Check policy before executing low-level open_path
+        path_str = str(value)
+        eval_res = policy.evaluate("open_path", {"path": path_str}, tool_meta={"capability": ToolCapability.PROCESS_START, "risk": ActionRisk.HIGH})
+        if eval_res.is_denied:
+            audit_logger.log(
+                request_id="http_command",
+                step_id=None,
+                source="http",
+                tool="open_path",
+                capability="PROCESS_START",
+                risk="CRITICAL",
+                decision="DENY",
+                execution_status="DENIED",
+                resource=path_str,
+                error=eval_res.reason,
+            )
+            return jsonify({"ok": False, "error": f"Security policy denied open_path: {eval_res.reason}", "security_denied": True}), 403
+
         try:
-            print(f"[DEBUG] Launching directly via open_path: {value}")
+            print(f"[LOW-LEVEL] Protected launch via open_path: {value}")
             if not os.path.exists(value):
                 result = {"ok": False, "error": f"Path does not exist: {value}"}
             else:
@@ -282,6 +318,11 @@ def command():
                 result = {"ok": True, "result": f"FALLBACK SUCCESS: {value}", "pid": proc.pid}
             except Exception as e2:
                 result = {"ok": False, "error": f"FAILED: {str(e2)}"}
+    elif action == "refresh_apps":
+        load_scanned_apps(force=True)
+        result = {"apps_loaded": len(scanned_apps)}
+    elif action == "open":
+        result = open_program(value)
     elif action == "learn_preference":
         if isinstance(value, dict):
             query = value.get("query")

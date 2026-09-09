@@ -22,9 +22,15 @@ def _resolve_under_root(ctx: ToolContext, rel_path: str) -> str:
     return candidate
 
 
+from core.security_policy import ActionRisk, ToolCapability
+
+
 class ReadTextFileTool:
     name = "read_text_file"
     description = "Read a UTF-8 text file from workspace (safe, no binaries)."
+    capability = ToolCapability.READ_FILE
+    risk = ActionRisk.SAFE
+    timeout = 10.0
     input_schema: JSON = {
         "type": "object",
         "properties": {"path": {"type": "string"}, "max_chars": {"type": "integer"}},
@@ -56,6 +62,9 @@ class ReadTextFileTool:
 class WriteTextFileTool:
     name = "write_text_file"
     description = "Write a UTF-8 text file under workspace."
+    capability = ToolCapability.MODIFY_FILE
+    risk = ActionRisk.MEDIUM
+    timeout = 15.0
     input_schema: JSON = {
         "type": "object",
         "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
@@ -70,13 +79,13 @@ class WriteTextFileTool:
         except ValueError as e:
             return {"ok": False, "error": str(e)}
 
-        if state is not None and not state.data.get("action_confirmed"):
+        if state is not None and not state.data.get("action_confirmed") and not state.data.get("action_authorized"):
             return {
                 "ok": False,
                 "error": "CONFIRMATION_REQUIRED",
                 "message": f"Detekoval jsem zápis do souboru '{rel}'. Přejete si přesto pokračovat?"
             }
-        if state is not None:
+        if state is not None and not state.data.get("action_authorized"):
             state.data["action_confirmed"] = False
 
         if ctx.dry_run:
@@ -105,6 +114,9 @@ class WriteTextFileTool:
 class ListDirTool:
     name = "list_dir"
     description = "List files in a directory under workspace."
+    capability = ToolCapability.READ_FILE
+    risk = ActionRisk.SAFE
+    timeout = 10.0
     input_schema: JSON = {
         "type": "object",
         "properties": {"path": {"type": "string"}},

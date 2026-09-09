@@ -16,6 +16,9 @@ from core.template import render_templates
 from core.task_memory import TaskMemory
 from core.verification import StepVerifierRegistry, VerificationStatus, VerificationResult
 from core.observation import Observation, ObservationType
+from core.security_policy import ActionRisk, PolicyDecision, ResourceScope, SecurityPolicy, ToolCapability
+from core.confirmation import ConfirmationManager, ConfirmationRequest, ConfirmationStatus
+from core.action_audit import ActionAuditLogger, get_audit_logger
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +99,9 @@ class Executor:
     event_bus: Any = None
     planner: Any = None
     verifier: Any = None
+    security_policy: SecurityPolicy | None = None
+    confirmation_manager: ConfirmationManager | None = None
+    audit_logger: ActionAuditLogger | None = None
     max_steps: int = 15
     max_retries: int = 0
     max_repairs: int = 1
@@ -162,7 +168,9 @@ class Executor:
                 self.request_context.current_step = step_idx + 1
 
             tool_name = str(step.get("tool", "")).strip()
-            tool_input = step.get("input", {})
+            tool_input = step.get("input")
+            if tool_input is None:
+                tool_input = step.get("args", {})
             if not isinstance(tool_input, dict):
                 tool_input = {"value": tool_input}
 
@@ -186,7 +194,274 @@ class Executor:
             tool_input = render_templates(tool_input, self.state)
             total_executed_steps += 1
 
-            # 3. Execute tool with cooperative retry
+            # --- SECURITY GATE ---
+            tool_obj = self.registry.get(tool_name)
+            req_id = self.request_context.request_id if self.request_context else "default_req"
+            step_number = step_idx + 1
+            source = getattr(self.request_context, "source", "unknown")
+            policy = self.security_policy or SecurityPolicy()
+            audit_logger = self.audit_logger or get_audit_logger()
+            cm = self.confirmation_manager
+
+            # 1. Reject unknown tool
+            if not tool_obj:
+                deny_msg = f"Unknown tool '{tool_name}' is not registered."
+                audit_logger.log(
+                    request_id=req_id,
+                    step_id=step_number,
+                    source=source,
+                    tool=tool_name,
+                    capability="UNKNOWN",
+                    risk="CRITICAL",
+                    decision="DENY",
+                    execution_status="DENIED",
+                    error=deny_msg,
+                )
+                if self.task_memory:
+                    self.task_memory.update_step_status(step_idx, "failed", deny_msg)
+                if self.on_step_update:
+                    self.on_step_update(step_idx, "failed")
+                if self.request_context and not self.request_context.is_terminal:
+                    self.request_context.transition_to(RequestStatus.FAILED, error=deny_msg, event_bus=self.event_bus)
+                step_res = StepResult(
+                    step_index=step_number,
+                    tool=tool_name,
+                    input=tool_input,
+                    output={"ok": False, "error": deny_msg, "security_denied": True},
+                    status=StepExecutionStatus.TERMINAL_ERROR,
+                    execution_status="denied",
+                    error=deny_msg,
+                    state_snapshot=self.state.snapshot(),
+                )
+                results.append(step_res)
+                if self.event_bus:
+                    self.event_bus.emit(
+                        "step_completed",
+                        {
+                            "request_id": req_id,
+                            "step_index": step_number,
+                            "tool": tool_name,
+                            "ok": False,
+                            "status": "denied",
+                            "error": deny_msg,
+                        },
+                    )
+                break
+
+            # 2. Reject invalid tool arguments
+            is_valid_args, arg_err = self.registry.validate_input(tool_name, tool_input)
+            if not is_valid_args:
+                deny_msg = f"Invalid tool arguments: {arg_err}"
+                audit_logger.log(
+                    request_id=req_id,
+                    step_id=step_number,
+                    source=source,
+                    tool=tool_name,
+                    capability=str(getattr(tool_obj, "capability", "UNKNOWN")),
+                    risk=str(getattr(tool_obj, "risk", "HIGH")),
+                    decision="DENY",
+                    execution_status="DENIED",
+                    error=deny_msg,
+                )
+                if self.task_memory:
+                    self.task_memory.update_step_status(step_idx, "failed", deny_msg)
+                if self.on_step_update:
+                    self.on_step_update(step_idx, "failed")
+                if self.request_context and not self.request_context.is_terminal:
+                    self.request_context.transition_to(RequestStatus.FAILED, error=deny_msg, event_bus=self.event_bus)
+                step_res = StepResult(
+                    step_index=step_number,
+                    tool=tool_name,
+                    input=tool_input,
+                    output={"ok": False, "error": deny_msg, "security_denied": True},
+                    status=StepExecutionStatus.TERMINAL_ERROR,
+                    execution_status="denied",
+                    error=deny_msg,
+                    state_snapshot=self.state.snapshot(),
+                )
+                results.append(step_res)
+                if self.event_bus:
+                    self.event_bus.emit(
+                        "step_completed",
+                        {
+                            "request_id": req_id,
+                            "step_index": step_number,
+                            "tool": tool_name,
+                            "ok": False,
+                            "status": "denied",
+                            "error": deny_msg,
+                        },
+                    )
+                break
+
+            # 3. Evaluate SecurityPolicy (Fail-closed)
+            tool_meta = {
+                "capability": getattr(tool_obj, "capability", None),
+                "risk": getattr(tool_obj, "risk", None),
+                "timeout": getattr(tool_obj, "timeout", None),
+            }
+            eval_res = policy.evaluate(tool_name, tool_input, self.request_context, tool_meta=tool_meta)
+
+            if eval_res.is_denied:
+                audit_logger.log(
+                    request_id=req_id,
+                    step_id=step_number,
+                    source=source,
+                    tool=tool_name,
+                    capability=str(eval_res.capability),
+                    risk=str(eval_res.risk),
+                    decision=str(eval_res.decision),
+                    execution_status="DENIED",
+                    resource=eval_res.target_resource,
+                    error=eval_res.reason,
+                )
+                if self.task_memory:
+                    self.task_memory.update_step_status(step_idx, "failed", eval_res.reason)
+                if self.on_step_update:
+                    self.on_step_update(step_idx, "failed")
+                if self.request_context and not self.request_context.is_terminal:
+                    self.request_context.transition_to(RequestStatus.FAILED, error=eval_res.reason, event_bus=self.event_bus)
+                step_res = StepResult(
+                    step_index=step_number,
+                    tool=tool_name,
+                    input=tool_input,
+                    output={"ok": False, "error": eval_res.reason, "security_denied": True},
+                    status=StepExecutionStatus.TERMINAL_ERROR,
+                    execution_status="denied",
+                    error=eval_res.reason,
+                    state_snapshot=self.state.snapshot(),
+                )
+                results.append(step_res)
+                if self.event_bus:
+                    self.event_bus.emit(
+                        "step_completed",
+                        {
+                            "request_id": req_id,
+                            "step_index": step_number,
+                            "tool": tool_name,
+                            "ok": False,
+                            "status": "denied",
+                            "error": eval_res.reason,
+                        },
+                    )
+                break
+
+            confirmation_status_str = None
+            if eval_res.requires_confirmation:
+                conf = None
+                if cm:
+                    conf = cm.get_confirmation(req_id, step_number, tool_name)
+
+                if conf and conf.is_approved:
+                    confirmation_status_str = "APPROVED"
+                    self.state.data["action_authorized"] = True
+                elif conf and conf.is_expired:
+                    exp_msg = f"Confirmation for step {step_number} ({tool_name}) has expired."
+                    audit_logger.log(
+                        request_id=req_id,
+                        step_id=step_number,
+                        source=source,
+                        tool=tool_name,
+                        capability=str(eval_res.capability),
+                        risk=str(eval_res.risk),
+                        decision=str(eval_res.decision),
+                        confirmation_status="EXPIRED",
+                        execution_status="DENIED",
+                        resource=eval_res.target_resource,
+                        error=exp_msg,
+                    )
+                    if self.task_memory:
+                        self.task_memory.update_step_status(step_idx, "failed", exp_msg)
+                    if self.on_step_update:
+                        self.on_step_update(step_idx, "failed")
+                    if self.request_context and not self.request_context.is_terminal:
+                        self.request_context.transition_to(RequestStatus.FAILED, error=exp_msg, event_bus=self.event_bus)
+                    step_res = StepResult(
+                        step_index=step_number,
+                        tool=tool_name,
+                        input=tool_input,
+                        output={"ok": False, "error": exp_msg, "expired": True},
+                        status=StepExecutionStatus.TERMINAL_ERROR,
+                        execution_status="expired",
+                        error=exp_msg,
+                        state_snapshot=self.state.snapshot(),
+                    )
+                    results.append(step_res)
+                    break
+                else:
+                    if cm:
+                        conf = cm.create_confirmation(
+                            request_id=req_id,
+                            step_id=step_number,
+                            tool=tool_name,
+                            capability=eval_res.capability,
+                            risk=eval_res.risk,
+                            resource=eval_res.target_resource,
+                            summary=eval_res.reason,
+                        )
+                    user_prompt = conf.build_user_prompt() if conf else f"Potvrdit akci {tool_name}: {eval_res.reason}"
+                    audit_logger.log(
+                        request_id=req_id,
+                        step_id=step_number,
+                        source=source,
+                        tool=tool_name,
+                        capability=str(eval_res.capability),
+                        risk=str(eval_res.risk),
+                        decision=str(eval_res.decision),
+                        confirmation_status="PENDING",
+                        execution_status="PAUSED",
+                        resource=eval_res.target_resource,
+                    )
+                    if self.task_memory:
+                        self.task_memory.update_step_status(step_idx, "paused")
+                    if self.on_step_update:
+                        self.on_step_update(step_idx, "paused")
+                    if self.request_context and not self.request_context.is_terminal:
+                        self.request_context.transition_to(
+                            RequestStatus.WAITING_FOR_USER,
+                            event_bus=self.event_bus,
+                            message=user_prompt,
+                        )
+                    self.state.data["user_help_required"] = user_prompt
+                    self.state.data["paused_step_index"] = step_idx
+                    self.state.data["pending_confirmation"] = {
+                        "request_id": req_id,
+                        "step_index": step_idx,
+                        "step_number": step_number,
+                        "tool": tool_name,
+                        "capability": str(eval_res.capability),
+                        "risk": str(eval_res.risk),
+                        "resource": eval_res.target_resource,
+                        "prompt": user_prompt,
+                        "created_at": conf.created_at if conf else None,
+                        "expires_at": conf.expires_at if conf else None,
+                    }
+                    if self.event_bus:
+                        self.event_bus.emit(
+                            "confirmation_required",
+                            {
+                                "request_id": req_id,
+                                "step_index": step_number,
+                                "tool": tool_name,
+                                "prompt": user_prompt,
+                            },
+                        )
+                    step_res = StepResult(
+                        step_index=step_number,
+                        tool=tool_name,
+                        input=tool_input,
+                        output={"ok": False, "error": "CONFIRMATION_REQUIRED", "message": user_prompt},
+                        status=StepExecutionStatus.WAITING_FOR_CONFIRMATION,
+                        execution_status="waiting_for_confirmation",
+                        error="CONFIRMATION_REQUIRED",
+                        state_snapshot=self.state.snapshot(),
+                    )
+                    results.append(step_res)
+                    break
+            else:
+                self.state.data["action_authorized"] = True
+
+            # 4. Execute tool with cooperative retry
             out = None
             cancelled_during_run = False
 
@@ -638,6 +913,21 @@ class Executor:
                         state_snapshot=self.state.snapshot(),
                     )
                     results.append(step_res)
+                    audit_logger.log(
+                        request_id=req_id,
+                        step_id=step_number,
+                        source=source,
+                        tool=tool_name,
+                        capability=str(eval_res.capability),
+                        risk=str(eval_res.risk),
+                        decision=str(eval_res.decision),
+                        confirmation_status=confirmation_status_str,
+                        execution_status="FAILED",
+                        verification_status=verification_status,
+                        resource=eval_res.target_resource,
+                        error=error_msg,
+                    )
+                    self.state.data.pop("action_authorized", None)
                     if self.event_bus:
                         self.event_bus.emit(
                             "step_completed",
@@ -660,6 +950,7 @@ class Executor:
             # Invariant check: only reached if step succeeded natively or was successfully auto-repaired
             if self._is_cancelled():
                 print(f"[EXECUTOR] Execution cancelled right after step completion at step {step_idx+1}")
+                self.state.data.pop("action_authorized", None)
                 break
 
             # State updates for successful step
@@ -695,6 +986,20 @@ class Executor:
                 state_snapshot=self.state.snapshot(),
             )
             results.append(step_res)
+            audit_logger.log(
+                request_id=req_id,
+                step_id=step_number,
+                source=source,
+                tool=tool_name,
+                capability=str(eval_res.capability),
+                risk=str(eval_res.risk),
+                decision=str(eval_res.decision),
+                confirmation_status=confirmation_status_str,
+                execution_status="SUCCESS",
+                verification_status=verification_status,
+                resource=eval_res.target_resource,
+            )
+            self.state.data.pop("action_authorized", None)
             step_idx += 1
         return results
 
