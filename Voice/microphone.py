@@ -29,7 +29,9 @@ class RecordingResult:
 
 
 def normalize_audio(audio: np.ndarray, peak: float = 0.95) -> np.ndarray:
-    max_value = float(np.max(np.abs(audio))) if len(audio) else 0.0
+    if not len(audio):
+        return audio
+    max_value = float(np.max(np.abs(audio)))
     if max_value < 1e-6:
         return audio
     return np.clip(audio / max_value * peak, -1.0, 1.0)
@@ -57,6 +59,8 @@ def filter_audio(audio: np.ndarray, sample_rate: int) -> np.ndarray:
 
 
 class Microphone:
+    """Thread-safe microphone capture with VAD silence stop, filtering, and volume reporting."""
+
     def __init__(self, config: VoiceConfig):
         self.config = config
         self.sample_rate = int(config.sample_rate)
@@ -91,12 +95,11 @@ class Microphone:
         frame_callback: Optional[AudioCallback] = None,
         speech_callback: Optional[SpeechCallback] = None,
     ) -> None:
-        import sounddevice as sd
-
         with self._lock:
+            # Clean up previous stream if still open
             self.stop()
             self.clear()
-            self._recording.set()
+
             speech_seen = False
 
             def callback(indata, frames, time_info, status):
@@ -112,40 +115,64 @@ class Microphone:
                     speech_seen = True
                     LOGGER.info("Speech start")
                     if speech_callback:
-                        speech_callback()
+                        try:
+                            speech_callback()
+                        except Exception as exc:
+                            LOGGER.debug("Error in speech_callback: %s", exc)
                 if volume_callback:
-                    volume_callback(vad.volume)
+                    try:
+                        volume_callback(vad.volume)
+                    except Exception as exc:
+                        LOGGER.debug("Error in volume_callback: %s", exc)
                 self.frames.put(audio.copy())
                 if frame_callback:
-                    frame_callback(audio.copy(), self.sample_rate)
+                    try:
+                        frame_callback(audio.copy(), self.sample_rate)
+                    except Exception as exc:
+                        LOGGER.debug("Error in frame_callback: %s", exc)
 
-            self._stream = sd.InputStream(
-                samplerate=self.sample_rate,
-                channels=1,
-                dtype="float32",
-                blocksize=self.blocksize,
-                device=self.config.microphone_device,
-                callback=callback,
-            )
-            self._stream.start()
+            try:
+                import sounddevice as sd
+
+                self._recording.set()
+                self._stream = sd.InputStream(
+                    samplerate=self.sample_rate,
+                    channels=1,
+                    dtype="float32",
+                    blocksize=self.blocksize,
+                    device=self.config.microphone_device,
+                    callback=callback,
+                )
+                self._stream.start()
+            except Exception as exc:
+                self._recording.clear()
+                self._stream = None
+                LOGGER.warning("Failed to start microphone input stream: %s", exc)
+                raise
 
     def stop(self) -> None:
-        self._recording.clear()
-        stream = self._stream
-        self._stream = None
-        if stream is not None:
-            try:
-                stream.stop()
-                stream.close()
-            except Exception as exc:
-                LOGGER.warning("Could not close audio stream: %s", exc)
+        with self._lock:
+            self._recording.clear()
+            stream = self._stream
+            self._stream = None
+            if stream is not None:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception as exc:
+                    LOGGER.warning("Could not close audio stream: %s", exc)
 
     def record_until_silence(
         self,
         volume_callback: Optional[VolumeCallback] = None,
         speech_callback: Optional[SpeechCallback] = None,
     ) -> RecordingResult:
-        self.start(volume_callback=volume_callback, speech_callback=speech_callback)
+        try:
+            self.start(volume_callback=volume_callback, speech_callback=speech_callback)
+        except Exception as exc:
+            LOGGER.warning("Microphone start failed during record_until_silence: %s", exc)
+            return RecordingResult(np.array([], dtype="float32"), self.sample_rate, 0.0, False)
+
         chunks: list[np.ndarray] = []
         start = time.perf_counter()
         last_speech: Optional[float] = None

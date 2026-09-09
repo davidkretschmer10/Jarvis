@@ -21,11 +21,14 @@ class PlaybackItem:
 
 
 class AudioOutput:
+    """Thread-safe, queued audio output worker using sounddevice."""
+
     def __init__(self, device: Optional[int | str] = None):
         self.device = device
         self._queue: "queue.Queue[Optional[PlaybackItem]]" = queue.Queue()
         self._stop_event = threading.Event()
-        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._lock = threading.RLock()
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True, name="AudioOutputWorker")
         self._worker.start()
 
     def play(self, audio: np.ndarray, sample_rate: int, volume: float = 1.0) -> None:
@@ -33,15 +36,18 @@ class AudioOutput:
             self._queue.put(PlaybackItem(audio.astype("float32"), int(sample_rate), float(volume)))
 
     def stop(self) -> None:
-        self._stop_event.set()
-        try:
-            import sounddevice as sd
+        with self._lock:
+            self._stop_event.set()
+            try:
+                import sounddevice as sd
 
-            sd.stop()
-        except Exception as exc:
-            LOGGER.debug("Audio stop failed: %s", exc)
-        self.clear()
-        self._stop_event.clear()
+                sd.stop()
+            except Exception as exc:
+                LOGGER.debug("Audio stop failed: %s", exc)
+            self.clear()
+            # Brief delay before clearing stop_event to let worker notice cancellation
+            time.sleep(0.01)
+            self._stop_event.clear()
 
     def clear(self) -> None:
         while not self._queue.empty():
@@ -51,12 +57,19 @@ class AudioOutput:
             except queue.Empty:
                 break
 
-    def shutdown(self) -> None:
-        self._queue.put(None)
+    def shutdown(self, timeout: float = 2.0) -> None:
+        with self._lock:
+            self.stop()
+            self._queue.put(None)
+        if self._worker.is_alive():
+            self._worker.join(timeout=timeout)
 
     def _worker_loop(self) -> None:
         while True:
-            item = self._queue.get()
+            try:
+                item = self._queue.get()
+            except Exception:
+                break
             try:
                 if item is None:
                     return
@@ -66,10 +79,20 @@ class AudioOutput:
             except Exception as exc:
                 LOGGER.warning("Audio playback failed: %s", exc)
             finally:
-                self._queue.task_done()
+                try:
+                    self._queue.task_done()
+                except ValueError:
+                    pass
 
     def _play_now(self, item: PlaybackItem) -> None:
-        import sounddevice as sd
+        if self._stop_event.is_set():
+            return
+
+        try:
+            import sounddevice as sd
+        except ImportError:
+            LOGGER.warning("sounddevice module not available for playback")
+            return
 
         start = time.perf_counter()
         audio = item.audio

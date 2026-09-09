@@ -15,6 +15,10 @@ fake_voice.start_recording = Mock()
 fake_voice.stop_recording = Mock()
 fake_voice.stop_wake_listener = Mock()
 fake_voice.wake_listener = Mock()
+fake_voice.set_event_bus = Mock()
+fake_voice.get_voice_state = Mock(return_value="stopped")
+fake_voice.get_voice_config = Mock()
+fake_voice.speak_stream = Mock(return_value="")
 
 sys.modules.setdefault("interfaces.voice", fake_voice)
 

@@ -1,8 +1,16 @@
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
-from Voice.voice_manager import get_voice_manager
+from Voice.voice_manager import VoiceState, get_voice_manager
+
+
+def set_event_bus(event_bus: Any) -> None:
+    get_voice_manager().set_event_bus(event_bus)
+
+
+def get_voice_state() -> VoiceState:
+    return get_voice_manager().state
 
 
 def start_recording(volume_callback: Optional[Callable[[int], None]] = None) -> None:

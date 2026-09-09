@@ -6,7 +6,7 @@ import re
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Iterable, Optional
+from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 
@@ -20,13 +20,13 @@ SENTENCE_RE = re.compile(r"([^.!?\n]+[.!?\n]+)")
 DEFAULT_MAX_TTS_CHARS = 180
 
 
-def split_for_tts(text: str, max_chars: int = DEFAULT_MAX_TTS_CHARS) -> list[str]:
+def split_for_tts(text: str, max_chars: int = DEFAULT_MAX_TTS_CHARS) -> List[str]:
     cleaned = re.sub(r"\s+", " ", str(text)).strip()
     if not cleaned:
         return []
     if len(cleaned) <= max_chars:
         return [cleaned]
-    chunks: list[str] = []
+    chunks: List[str] = []
     current = ""
     tokens = re.split(r"(\s+|[,;:]\s*)", cleaned)
     for token in tokens:
@@ -44,8 +44,8 @@ def split_for_tts(text: str, max_chars: int = DEFAULT_MAX_TTS_CHARS) -> list[str
     return chunks
 
 
-def split_sentences(buffer: str, max_chars: int = DEFAULT_MAX_TTS_CHARS) -> tuple[list[str], str]:
-    sentences: list[str] = []
+def split_sentences(buffer: str, max_chars: int = DEFAULT_MAX_TTS_CHARS) -> Tuple[List[str], str]:
+    sentences: List[str] = []
     consumed = 0
     for match in SENTENCE_RE.finditer(buffer):
         text = match.group(1).strip()
@@ -56,12 +56,14 @@ def split_sentences(buffer: str, max_chars: int = DEFAULT_MAX_TTS_CHARS) -> tupl
 
 
 class BaseTTS(ABC):
+    """Abstract base class for local text-to-speech synthesis with async sentence queue."""
+
     def __init__(self, config: VoiceConfig, audio_output: Optional[AudioOutput] = None):
         self.config = config
         self.audio_output = audio_output or AudioOutput(config.speaker_device)
         self._queue: "queue.Queue[Optional[str]]" = queue.Queue()
         self._stop_event = threading.Event()
-        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True, name="TTSWorker")
         self._worker.start()
 
     def speak(self, text: str) -> None:
@@ -94,12 +96,14 @@ class BaseTTS(ABC):
                 break
         self._stop_event.clear()
 
-    def shutdown(self) -> None:
+    def shutdown(self, timeout: float = 2.0) -> None:
         self._queue.put(None)
-        self.audio_output.shutdown()
+        if self._worker.is_alive():
+            self._worker.join(timeout=timeout)
+        self.audio_output.shutdown(timeout=timeout)
 
     @abstractmethod
-    def synthesize(self, text: str) -> tuple[np.ndarray, int]:
+    def synthesize(self, text: str) -> Tuple[np.ndarray, int]:
         raise NotImplementedError
 
     def normalize_text(self, text: str) -> str:
@@ -115,9 +119,16 @@ class BaseTTS(ABC):
             out = out.replace(source, target)
         return out.strip()
 
+    # Backwards compatibility alias
+    def _normalize_text(self, text: str) -> str:
+        return self.normalize_text(text)
+
     def _worker_loop(self) -> None:
         while True:
-            text = self._queue.get()
+            try:
+                text = self._queue.get()
+            except Exception:
+                break
             try:
                 if text is None:
                     return
@@ -134,10 +145,15 @@ class BaseTTS(ABC):
             except Exception as exc:
                 LOGGER.warning("TTS worker failed: %s", exc)
             finally:
-                self._queue.task_done()
+                try:
+                    self._queue.task_done()
+                except ValueError:
+                    pass
 
 
 class PiperTTS(BaseTTS):
+    """Local Piper neural TTS engine optimized for Czech speech."""
+
     def __init__(self, config: VoiceConfig, audio_output: Optional[AudioOutput] = None):
         self.voice = None
         super().__init__(config, audio_output)
@@ -149,7 +165,7 @@ class PiperTTS(BaseTTS):
         except Exception as exc:
             LOGGER.warning("Piper unavailable: %s", exc)
 
-    def synthesize(self, text: str) -> tuple[np.ndarray, int]:
+    def synthesize(self, text: str) -> Tuple[np.ndarray, int]:
         if not self.voice or not text:
             return np.array([], dtype="float32"), 22050
         try:
@@ -159,28 +175,28 @@ class PiperTTS(BaseTTS):
             audio_chunks = [chunk.audio_float_array for chunk in self.voice.synthesize(text, syn_config=syn_config)]
         except Exception as exc:
             LOGGER.warning("Piper generation failed: %s", exc)
-            return np.array([], dtype="float32"), self.voice.config.sample_rate
+            return np.array([], dtype="float32"), getattr(self.voice.config, "sample_rate", 22050)
         if not audio_chunks:
-            return np.array([], dtype="float32"), self.voice.config.sample_rate
+            return np.array([], dtype="float32"), getattr(self.voice.config, "sample_rate", 22050)
         audio = np.concatenate(audio_chunks).astype("float32")
         audio = self._post_process_audio(audio)
         return audio, self.voice.config.sample_rate
 
     def _post_process_audio(self, audio: np.ndarray) -> np.ndarray:
-        if not len(audio):
+        if not len(audio) or not self.voice:
             return audio
+        sr = getattr(self.voice.config, "sample_rate", 22050)
         if self.config.pitch != 0:
             try:
                 import librosa
 
-                audio = librosa.effects.pitch_shift(audio, sr=self.voice.config.sample_rate, n_steps=self.config.pitch)
+                audio = librosa.effects.pitch_shift(audio, sr=sr, n_steps=self.config.pitch)
             except Exception as exc:
                 LOGGER.debug("Pitch shift skipped: %s", exc)
         if self.config.tts_ai_style:
             try:
                 import scipy.signal as signal
 
-                sr = self.voice.config.sample_rate
                 b, a = signal.iirpeak(120 / (sr / 2), 1.5)
                 audio = audio + signal.lfilter(b, a, audio) * 0.3
             except Exception as exc:
@@ -188,22 +204,10 @@ class PiperTTS(BaseTTS):
         return normalize_audio(np.asarray(audio, dtype="float32"), peak=0.85)
 
 
-class ChatterboxTTS(BaseTTS):
-    def synthesize(self, text: str) -> tuple[np.ndarray, int]:
-        LOGGER.warning("ChatterboxTTS backend is configured but not installed in this project.")
-        return np.array([], dtype="float32"), 22050
-
-
-class FutureTTS(BaseTTS):
-    def synthesize(self, text: str) -> tuple[np.ndarray, int]:
-        LOGGER.warning("FutureTTS is a placeholder backend.")
-        return np.array([], dtype="float32"), 22050
+# Legacy alias
+PiperEngine = PiperTTS
 
 
 def create_tts(config: VoiceConfig, audio_output: Optional[AudioOutput] = None) -> BaseTTS:
-    backend = (config.tts_backend or "piper").lower()
-    if backend == "chatterbox":
-        return ChatterboxTTS(config, audio_output)
-    if backend == "future":
-        return FutureTTS(config, audio_output)
+    """TTS engine factory returning local offline PiperTTS."""
     return PiperTTS(config, audio_output)

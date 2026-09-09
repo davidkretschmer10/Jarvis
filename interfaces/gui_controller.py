@@ -77,6 +77,12 @@ class GuiController(QObject):
         self.current_chat = list(self.chats.keys())[0]
         self.recording = False
         self.voice_active = False
+        self._voice_chat_lock = threading.RLock()
+        try:
+            from interfaces.voice import set_event_bus
+            set_event_bus(event_bus)
+        except Exception:
+            pass
         self.runtime = JarvisRuntime(event_bus=event_bus)
         self.voice_read_enabled = False
         self.pending_router_choice = None
@@ -493,8 +499,8 @@ class GuiController(QObject):
         threading.Thread(target=transcribe_task, daemon=True).start()
 
     def handle_voice_text(self, text: str):
-        from ai.engine import reset_current_request
-        reset_current_request()
+        from core.lifecycle import reset_current_request
+        reset_current_request(goal=text, source="voice")
 
         self.user_message_received.emit(f"Voice: {text}")
         self.chats[self.current_chat]["messages"].append(f"Ty: {text}")
@@ -539,22 +545,26 @@ class GuiController(QObject):
             self.status_changed.emit("Ready")
             self.event_bus.emit("ai_response", full_reply)
 
-        worker = threading.Thread(target=ai_task, daemon=True)
+        worker = threading.Thread(target=ai_task, daemon=True, name="VoiceAITask")
         worker.start()
         return worker
 
     def start_voice_chat(self):
-        if self.voice_active:
-            return
-        self.voice_active = True
-        self.voice_status_changed.emit("Voice: Listening")
-        threading.Thread(target=self.voice_conversation_loop, daemon=True).start()
+        with self._voice_chat_lock:
+            if self.voice_active:
+                return
+            self.voice_active = True
+            self.voice_status_changed.emit("Voice: Listening")
+            threading.Thread(target=self.voice_conversation_loop, daemon=True, name="VoiceConversationLoop").start()
 
     def stop_voice_chat(self):
-        self.voice_active = False
-        interrupt_speech()
-        vs_stop()
-        self.voice_status_changed.emit("Voice: Disconnected")
+        with self._voice_chat_lock:
+            if not self.voice_active:
+                return
+            self.voice_active = False
+            interrupt_speech()
+            vs_stop()
+            self.voice_status_changed.emit("Voice: Disconnected")
 
     def voice_conversation_loop(self):
         while self.voice_active:

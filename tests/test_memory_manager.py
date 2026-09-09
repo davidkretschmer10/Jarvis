@@ -135,9 +135,10 @@ class TestMemoryManager(unittest.TestCase):
             try:
                 for i in range(10):
                     self.manager.update_profile(f"python interest {idx}_{i}")
-                    chats = self.manager.load_chats()
-                    chats[f"Thread_{idx}"] = {"messages": [f"step {i}"]}
-                    self.manager.save_chats(chats)
+                    with self.manager._lock:
+                        chats = self.manager.load_chats()
+                        chats[f"Thread_{idx}"] = {"messages": [f"step {i}"]}
+                        self.manager.save_chats(chats)
             except Exception as e:
                 errors.append(e)
 
