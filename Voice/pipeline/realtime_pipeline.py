@@ -32,16 +32,27 @@ class PipelineCallbacks:
 
 
 class RealtimeVoicePipeline:
-    """Wake -> record -> transcribe -> stream AI -> sentence TTS orchestration."""
+    """
+    DEPRECATED ADAPTER: Wake -> record -> transcribe -> stream AI -> sentence TTS orchestration.
+
+    Note: In Jarvis production architecture, all voice commands route through
+    JarvisRuntime (One True Runtime) to ensure SecurityPolicy, ActionAuditLogger,
+    and Verification enforcement. This class is retained as a compatibility adapter.
+    """
 
     def __init__(
         self,
         config: Optional[VoiceConfig] = None,
         response_stream_factory: Optional[ResponseStreamFactory] = None,
         callbacks: Optional[PipelineCallbacks] = None,
+        runtime: Optional[Any] = None,
     ):
+        LOGGER.warning(
+            "RealtimeVoicePipeline is deprecated. All authoritative commands must execute via JarvisRuntime."
+        )
         self.config = config or VoiceConfig()
         self.callbacks = callbacks or PipelineCallbacks()
+        self.runtime = runtime
         self.response_stream_factory = response_stream_factory or (lambda text: iter([text]))
         self.capture = AudioCapture(self.config)
         self.stt = WhisperEngine(self.config)

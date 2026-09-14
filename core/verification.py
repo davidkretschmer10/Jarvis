@@ -632,6 +632,8 @@ class UIInteractionVerifier(BaseVerifier):
     Verifies mouse and keyboard actions.
     CRITICAL RULE: UI interactions without a concrete, validated delta
     must return UNKNOWN, NEVER automatically VERIFIED.
+    Supports screen delta, OCR text appearance/disappearance, window title changes,
+    and expected GUI states.
     """
 
     def can_verify(self, step: Dict[str, Any], tool_output: Dict[str, Any]) -> bool:
@@ -642,9 +644,15 @@ class UIInteractionVerifier(BaseVerifier):
             "double_click",
             "type_text",
             "type",
+            "write_text",
             "press_key",
             "hotkey",
             "gui_click",
+            "smart_click",
+            "smart_write",
+            "smart_checkbox",
+            "confirm_dialog",
+            "cancel_dialog",
         } or "mouse" in tool or "keyboard" in tool
 
     def verify(
@@ -655,19 +663,155 @@ class UIInteractionVerifier(BaseVerifier):
         ctx: Optional[Any] = None,
     ) -> VerificationResult:
         tool = (step.get("tool") or "").lower()
-        # If the tool explicitly observed an element or state change via vision/OCR:
-        observed_delta = tool_output.get("observed_delta") or tool_output.get("verified")
-        if observed_delta is True:
+
+        # 1. Check explicit delta flag from tool output if provided
+        observed_delta = tool_output.get("observed_delta")
+        if observed_delta is True or tool_output.get("verified") is True:
             return VerificationResult(
                 status=VerificationStatus.VERIFIED,
                 verifier="UIInteractionVerifier",
-                expected="UI state delta observed",
+                expected=str(tool_output.get("expected") or "UI state delta observed"),
                 observed=str(tool_output.get("delta_evidence", "Delta confirmed")),
                 evidence=tool_output,
                 message="UI interaction verified via observed delta",
             )
+        elif observed_delta is False and "delta_evidence" in tool_output:
+            return VerificationResult(
+                status=VerificationStatus.FAILED,
+                verifier="UIInteractionVerifier",
+                expected=str(tool_output.get("expected") or "UI state delta expected"),
+                observed=str(tool_output.get("delta_evidence", "No change observed")),
+                evidence=tool_output,
+                message="Expected UI change was not observed",
+            )
 
-        # In the absence of an explicit verifiable delta, this CANNOT be declared VERIFIED.
+        # 2. Check expected conditions in step or tool_output
+        expected_spec = (
+            step.get("expected")
+            or (step.get("input") or {}).get("expected")
+            or (step.get("args") or {}).get("expected")
+            or tool_output.get("expected")
+        )
+        from core.vision import get_vision_service, OCRStatus
+        vision_service = get_vision_service()
+
+        if expected_spec:
+            if isinstance(expected_spec, str):
+                exp_str = expected_spec.strip()
+                if exp_str.lower().startswith("text appears:"):
+                    expected_spec = {"text_appears": exp_str.split(":", 1)[1].strip()}
+                elif exp_str.lower().startswith("window title contains:"):
+                    expected_spec = {"window_title": exp_str.split(":", 1)[1].strip()}
+                elif exp_str.lower().startswith("button disappears:"):
+                    expected_spec = {"element_disappears": exp_str.split(":", 1)[1].strip()}
+
+            if isinstance(expected_spec, dict):
+                # 2a. Window title condition
+                if "window_title" in expected_spec or "window_contains" in expected_spec:
+                    needed_title = (expected_spec.get("window_title") or expected_spec.get("window_contains", "")).lower()
+                    active_title = vision_service.get_active_window_title().lower()
+                    if needed_title in active_title:
+                        return VerificationResult(
+                            status=VerificationStatus.VERIFIED,
+                            verifier="UIInteractionVerifier",
+                            expected=f"Window title contains '{needed_title}'",
+                            observed=f"Active window: '{active_title}'",
+                            evidence={"active_title": active_title},
+                            message=f"Expected window state verified: '{active_title}'",
+                        )
+                    else:
+                        return VerificationResult(
+                            status=VerificationStatus.FAILED,
+                            verifier="UIInteractionVerifier",
+                            expected=f"Window title contains '{needed_title}'",
+                            observed=f"Active window is '{active_title}'",
+                            evidence={"active_title": active_title},
+                            message=f"Expected window title '{needed_title}' not found",
+                        )
+
+                # 2b. Text appears condition
+                if "text_appears" in expected_spec or "text" in expected_spec:
+                    needed_text = expected_spec.get("text_appears") or expected_spec.get("text", "")
+                    ocr_status = vision_service.ocr.get_status()
+                    if ocr_status != OCRStatus.OCR_AVAILABLE:
+                        return VerificationResult(
+                            status=VerificationStatus.UNKNOWN,
+                            verifier="UIInteractionVerifier",
+                            expected=f"Text '{needed_text}' appears",
+                            observed="OCR unavailable to verify text appearance",
+                            evidence={"ocr_status": ocr_status.value},
+                            message="Cannot verify text appearance because OCR is unavailable",
+                        )
+                    fresh_obs = vision_service.capture_observation(force_fresh=True)
+                    found = any(needed_text.lower() in el.text.lower() for el in fresh_obs.elements)
+                    if found:
+                        return VerificationResult(
+                            status=VerificationStatus.VERIFIED,
+                            verifier="UIInteractionVerifier",
+                            expected=f"Text '{needed_text}' appears on screen",
+                            observed=f"Found matching text on screen in window '{fresh_obs.window_title}'",
+                            evidence={"window": fresh_obs.window_title, "elements_count": len(fresh_obs.elements)},
+                            message=f"Verified: Text '{needed_text}' appeared",
+                        )
+                    else:
+                        return VerificationResult(
+                            status=VerificationStatus.FAILED,
+                            verifier="UIInteractionVerifier",
+                            expected=f"Text '{needed_text}' appears on screen",
+                            observed=f"Text not detected in window '{fresh_obs.window_title}'",
+                            evidence={"window": fresh_obs.window_title, "elements_count": len(fresh_obs.elements)},
+                            message=f"Verification failed: Text '{needed_text}' did not appear",
+                        )
+
+                # 2c. Element disappears condition
+                if "element_disappears" in expected_spec or "target_disappears" in expected_spec:
+                    target_text = expected_spec.get("element_disappears") or expected_spec.get("target_disappears", "")
+                    ocr_status = vision_service.ocr.get_status()
+                    if ocr_status != OCRStatus.OCR_AVAILABLE:
+                        return VerificationResult(
+                            status=VerificationStatus.UNKNOWN,
+                            verifier="UIInteractionVerifier",
+                            expected=f"Element '{target_text}' disappears",
+                            observed="OCR unavailable to verify element disappearance",
+                            evidence={"ocr_status": ocr_status.value},
+                            message="Cannot verify element disappearance because OCR is unavailable",
+                        )
+                    fresh_obs = vision_service.capture_observation(force_fresh=True)
+                    still_present = any(target_text.lower() in el.text.lower() for el in fresh_obs.elements)
+                    if not still_present:
+                        return VerificationResult(
+                            status=VerificationStatus.VERIFIED,
+                            verifier="UIInteractionVerifier",
+                            expected=f"Element '{target_text}' disappears",
+                            observed="Element no longer present on screen",
+                            evidence={"window": fresh_obs.window_title},
+                            message=f"Verified: Element '{target_text}' disappeared",
+                        )
+                    else:
+                        return VerificationResult(
+                            status=VerificationStatus.FAILED,
+                            verifier="UIInteractionVerifier",
+                            expected=f"Element '{target_text}' disappears",
+                            observed="Element still visible on screen",
+                            evidence={"window": fresh_obs.window_title},
+                            message=f"Verification failed: Element '{target_text}' is still visible",
+                        )
+
+        # 3. Check screen hash delta between pre_hash and post_hash if present
+        pre_hash = tool_output.get("pre_hash")
+        post_hash = tool_output.get("post_hash")
+        if pre_hash and post_hash:
+            if pre_hash != post_hash:
+                return VerificationResult(
+                    status=VerificationStatus.VERIFIED,
+                    verifier="UIInteractionVerifier",
+                    expected="Screen visual delta after interaction",
+                    observed=f"Screen hash changed from {pre_hash} to {post_hash}",
+                    evidence={"pre_hash": pre_hash, "post_hash": post_hash},
+                    message="UI interaction verified via screen hash delta",
+                )
+
+        # 4. In the absence of an explicit verifiable delta, this CANNOT be declared VERIFIED.
         return VerificationResult(
             status=VerificationStatus.UNKNOWN,
             verifier="UIInteractionVerifier",

@@ -328,6 +328,24 @@ class SecurityPolicy:
         "powershell -encodedcommand",
     )
 
+    # High-risk UI click targets that require confirmation
+    HIGH_RISK_CLICK_PATTERNS = (
+        "delete", "smazat", "odstranit", "destroy",
+        "purchase", "koupit", "pay", "zaplatit", "checkout",
+        "shutdown", "vypnout", "restart", "reboot",
+        "submit", "odeslat", "send", "poslat",
+        "format", "erase",
+    )
+
+    @classmethod
+    def classify_click_risk(cls, target_text: str) -> ActionRisk:
+        """Classify the risk level of clicking a specific GUI target text."""
+        t = target_text.lower().strip()
+        for pat in cls.HIGH_RISK_CLICK_PATTERNS:
+            if pat in t:
+                return ActionRisk.HIGH
+        return ActionRisk.LOW
+
     def evaluate(
         self,
         tool_name: str,
@@ -483,6 +501,13 @@ class SecurityPolicy:
         # 8. Elevate risk for delete / overwrite actions
         if capability in (ToolCapability.DELETE_FILE, ToolCapability.DELETE_DIRECTORY):
             risk = max(risk, ActionRisk.HIGH)
+
+        # 8b. Elevate risk for destructive UI clicks
+        if capability in (ToolCapability.CLICK, ToolCapability.DOUBLE_CLICK, ToolCapability.UI_CLICK) or "click" in tool_name:
+            target_str = str(tool_input.get("target") or tool_input.get("text") or target_resource or "")
+            click_risk = self.classify_click_risk(target_str)
+            if click_risk >= ActionRisk.HIGH:
+                risk = max(risk, ActionRisk.HIGH)
 
         # 9. Evaluate Decision based on Risk Level & Scope
         if risk == ActionRisk.CRITICAL:

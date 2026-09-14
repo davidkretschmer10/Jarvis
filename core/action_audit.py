@@ -65,6 +65,9 @@ class ActionAuditRecord:
     verification_status: Optional[str] = None
     resource: Optional[str] = None
     error: Optional[str] = None
+    target_bbox: Optional[List[int]] = None
+    confidence: Optional[float] = None
+    resolver_source: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         raw = asdict(self)
@@ -111,6 +114,9 @@ class ActionAuditLogger:
         verification_status: Optional[str] = None,
         resource: Optional[str] = None,
         error: Optional[str] = None,
+        target_bbox: Optional[List[int]] = None,
+        confidence: Optional[float] = None,
+        resolver_source: Optional[str] = None,
     ) -> ActionAuditRecord:
         """Create and atomically persist an ActionAuditRecord."""
         record = ActionAuditRecord(
@@ -127,6 +133,9 @@ class ActionAuditLogger:
             verification_status=verification_status,
             resource=resource,
             error=str(error) if error else None,
+            target_bbox=target_bbox,
+            confidence=confidence,
+            resolver_source=resolver_source,
         )
 
         self._persist_record(record)

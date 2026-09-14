@@ -339,11 +339,30 @@ class SmartClickTool:
         if not (0 <= cx < sw and 0 <= cy < sh):
             return {"ok": False, "error": f"Souradnice [{cx}, {cy}] jsou mimo rozsah obrazovky [{sw}x{sh}]."}
             
+        from core.vision import get_vision_service
+        try:
+            v_service = get_vision_service()
+            pre_hash = v_service._cached_observation.image_hash if v_service._cached_observation else None
+        except Exception:
+            pre_hash = None
+
         res = _post_agent(ctx, "click", {"x": cx, "y": cy})
+
+        try:
+            post_obs = v_service.capture_observation(force_fresh=True)
+            post_hash = post_obs.image_hash
+        except Exception:
+            post_hash = None
+
+        observed_delta = (pre_hash != post_hash) if (pre_hash and post_hash) else None
+
         return {
             "ok": res.get("ok", False),
             "result": f"Kliknuto na prvek '{best_el.text}' ({best_el.type}) na [{cx}, {cy}].",
-            "element": best_el.to_dict(),
+            "element": best_el.to_dict() if hasattr(best_el, "to_dict") else dict(best_el),
+            "pre_hash": pre_hash,
+            "post_hash": post_hash,
+            "observed_delta": observed_delta,
         }
 
 
@@ -548,11 +567,30 @@ class ConfirmDialogTool:
         candidates.sort(key=lambda c: c[0], reverse=True)
         _, best_el = candidates[0]
         cx, cy = best_el.center
+        from core.vision import get_vision_service
+        try:
+            v_service = get_vision_service()
+            pre_hash = v_service._cached_observation.image_hash if v_service._cached_observation else None
+        except Exception:
+            pre_hash = None
+
         res = _post_agent(ctx, "click", {"x": cx, "y": cy})
+
+        try:
+            post_obs = v_service.capture_observation(force_fresh=True)
+            post_hash = post_obs.image_hash
+        except Exception:
+            post_hash = None
+
+        observed_delta = (pre_hash != post_hash) if (pre_hash and post_hash) else None
+
         return {
             "ok": res.get("ok", False),
             "result": f"Kliknuto na potvrzovaci tlacitko '{best_el.text}' na [{cx}, {cy}].",
-            "element": best_el.to_dict(),
+            "element": best_el.to_dict() if hasattr(best_el, "to_dict") else dict(best_el),
+            "pre_hash": pre_hash,
+            "post_hash": post_hash,
+            "observed_delta": observed_delta,
         }
 
 
@@ -585,11 +623,31 @@ class CancelDialogTool:
         candidates.sort(key=lambda c: c[0], reverse=True)
         _, best_el = candidates[0]
         cx, cy = best_el.center
+
+        from core.vision import get_vision_service
+        try:
+            v_service = get_vision_service()
+            pre_hash = v_service._cached_observation.image_hash if v_service._cached_observation else None
+        except Exception:
+            pre_hash = None
+
         res = _post_agent(ctx, "click", {"x": cx, "y": cy})
+
+        try:
+            post_obs = v_service.capture_observation(force_fresh=True)
+            post_hash = post_obs.image_hash
+        except Exception:
+            post_hash = None
+
+        observed_delta = (pre_hash != post_hash) if (pre_hash and post_hash) else None
+
         return {
             "ok": res.get("ok", False),
             "result": f"Kliknuto na storno tlacitko '{best_el.text}' na [{cx}, {cy}].",
-            "element": best_el.to_dict(),
+            "element": best_el.to_dict() if hasattr(best_el, "to_dict") else dict(best_el),
+            "pre_hash": pre_hash,
+            "post_hash": post_hash,
+            "observed_delta": observed_delta,
         }
 
 
