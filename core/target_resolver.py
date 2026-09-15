@@ -122,32 +122,54 @@ class TargetResolver:
         """
         Resolves a target query into a concrete ResolvedTarget with bounding box,
         confidence, and bounds validation.
+        Enforces strict resolution hierarchy:
+          1. Deterministic window / control
+          2. OCR text & bounding boxes
+          3. Local vision model
+          4. Explicit coordinates fallback
         """
-        # Step A: Handle coordinate queries directly (Priority 4, explicit coords)
-        coord_target = self._check_coordinate_target(target_query, observation)
-        if coord_target is not None:
-            return coord_target
+        query_str = str(target_query).strip()
 
-        # Step B: Ensure fresh observation
-        obs = observation
-        if obs is None or force_fresh_observation or obs.is_stale(self.max_observation_age):
+        # Step 0: Observation staleness validation
+        if observation is not None and not force_fresh_observation:
+            if observation.is_stale(self.max_observation_age):
+                return ResolvedTarget(
+                    name=query_str,
+                    bbox=BoundingBox(0, 0, 0, 0),
+                    confidence=0.0,
+                    source="stale_check",
+                    target_type="element",
+                    status=TargetResolutionStatus.STALE_OBSERVATION,
+                    error=f"Observation is stale (age > {self.max_observation_age:.1f}s) and cannot be used safely.",
+                )
+            obs = observation
+        else:
             obs = self.vision_service.capture_observation(force_fresh=True)
 
-        query_str = str(target_query).strip()
         clean_text, parsed_type = self.parse_semantic_query(query_str)
         target_type = expected_type or parsed_type or "element"
 
-        # Step C: Priority 1 - Deterministic window match
+        # Priority 1: Deterministic window match
         det_window = self._check_deterministic_window(clean_text, obs)
         if det_window is not None:
             return det_window
 
-        # Step D: Priority 2 - OCR element matching
+        # Priority 2: OCR element matching
         ocr_target = self._resolve_ocr_target(clean_text, target_type, obs)
         if ocr_target is not None:
             return ocr_target
 
-        # Step E: Target Not Found
+        # Priority 3: Local vision model (if installed and available)
+        vision_target = self._check_vision_model(clean_text, target_type, obs)
+        if vision_target is not None:
+            return vision_target
+
+        # Priority 4: Explicit coordinate fallback
+        coord_target = self._check_coordinate_target(target_query, obs)
+        if coord_target is not None:
+            return coord_target
+
+        # Target Not Found
         return ResolvedTarget(
             name=query_str,
             bbox=BoundingBox(0, 0, 0, 0),
@@ -157,6 +179,43 @@ class TargetResolver:
             status=TargetResolutionStatus.NOT_FOUND,
             error=f"Target '{query_str}' could not be resolved in the current GUI state.",
         )
+
+    def _check_vision_model(
+        self,
+        query: str,
+        target_type: str,
+        observation: VisionObservation,
+    ) -> Optional[ResolvedTarget]:
+        """Optionally resolve complex targets using local vision model if available."""
+        if not observation.screenshot_path:
+            return None
+        try:
+            from core.vision import VisionModelStatus
+            from pathlib import Path
+            if self.vision_service.vision.get_status() == VisionModelStatus.VISION_AVAILABLE:
+                status, analysis = self.vision_service.vision.analyze(
+                    Path(observation.screenshot_path),
+                    f"Find the coordinates [x, y] of UI element matching '{query}'.",
+                )
+                if status == VisionModelStatus.VISION_AVAILABLE and analysis:
+                    m = re.search(r"\[\s*(\d+)\s*,\s*(\d+)\s*\]", analysis)
+                    if m:
+                        x, y = int(m.group(1)), int(m.group(2))
+                        sw = observation.screen_width
+                        sh = observation.screen_height
+                        bbox = BoundingBox(x=x, y=y, width=10, height=10)
+                        if 0 <= x < sw and 0 <= y < sh:
+                            return ResolvedTarget(
+                                name=query,
+                                bbox=bbox,
+                                confidence=0.80,
+                                source="vision_model",
+                                target_type=target_type,
+                                status=TargetResolutionStatus.RESOLVED,
+                            )
+        except Exception:
+            pass
+        return None
 
     def _check_coordinate_target(
         self,

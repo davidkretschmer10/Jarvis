@@ -34,12 +34,16 @@ TaskStartCallback = Callable[[str, List[str]], None]
 
 
 class RequestExecutionStatus(str, Enum):
+    SUCCESS = "SUCCESS"
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
+    UNKNOWN = "UNKNOWN"
     CANCELLED = "CANCELLED"
     WAITING_FOR_CONFIRMATION = "WAITING_FOR_CONFIRMATION"
     PAUSED = "PAUSED"
     TIMEOUT = "TIMEOUT"
+    REPLANNED = "REPLANNED"
+    TERMINAL_ERROR = "TERMINAL_ERROR"
     CHAT_RESPONSE = "CHAT_RESPONSE"
 
 
@@ -417,6 +421,9 @@ class JarvisRuntime:
         ):
             cancel_current_request(reason=summary, event_bus=self.event_bus)
             status = RequestExecutionStatus.CANCELLED
+        elif any(r.get("verification_status") == "UNKNOWN" or r.get("status") == "UNKNOWN" for r in results):
+            fail_current_request(error=summary, event_bus=self.event_bus)
+            status = RequestExecutionStatus.UNKNOWN
         else:
             fail_current_request(error=summary, event_bus=self.event_bus)
             status = RequestExecutionStatus.FAILED
@@ -578,6 +585,9 @@ class JarvisRuntime:
         ):
             cancel_current_request(reason=summary, event_bus=self.event_bus)
             status = RequestExecutionStatus.CANCELLED
+        elif any(r.get("verification_status") == "UNKNOWN" or r.get("status") == "UNKNOWN" for r in results):
+            fail_current_request(error=summary, event_bus=self.event_bus)
+            status = RequestExecutionStatus.UNKNOWN
         else:
             fail_current_request(error=summary, event_bus=self.event_bus)
             status = RequestExecutionStatus.FAILED
@@ -667,7 +677,7 @@ class JarvisRuntime:
                 step_no = start_index + idx + 1
                 error = out.get("error", "Overeni vysledku akce selhalo")
                 return False, f"Ukol selhal na kroku {step_no}: {error}", False
-            if v_status == "UNKNOWN":
+            if v_status == "UNKNOWN" or status == "UNKNOWN":
                 has_unknown = True
 
         # 5. Check completed count vs total planned steps
@@ -676,7 +686,7 @@ class JarvisRuntime:
             return False, f"Ukol nebyl dokoncen: provedeno {start_index + executed_count} z {total_steps} kroku.", False
 
         if has_unknown:
-            return True, f"Ukol byl uspesne proveden (stav nekterych kroku zustal UNKNOWN). Celkem provedeno {total_steps} kroku.", False
+            return False, f"Ukol byl proveden, ale overeni kroku zustalo UNKNOWN. Provedeno {total_steps} kroku.", False
         return True, f"Ukol byl uspesne dokoncen a overen! Celkem provedeno {total_steps} kroku.", False
 
     def _emit(self, event_name: str, data: Any) -> None:

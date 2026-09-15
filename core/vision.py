@@ -352,17 +352,23 @@ class VisionService:
 
     def capture_screen_image(self, region: Optional[Tuple[int, int, int, int]] = None) -> Image.Image:
         """Capture screenshot via pyautogui and return PIL Image."""
-        return pyautogui.screenshot(region=region)
+        try:
+            return pyautogui.screenshot(region=region)
+        except Exception as exc:
+            logger.warning("pyautogui.screenshot failed (%s), returning fallback blank image", exc)
+            return Image.new("RGB", (1920, 1080), color=(255, 255, 255))
 
     def capture_observation(
         self,
         region: Optional[Tuple[int, int, int, int]] = None,
         force_fresh: bool = False,
         max_age: Optional[float] = None,
+        save_to_disk: bool = False,
     ) -> VisionObservation:
         """
         Capture or retrieve a cached VisionObservation.
-        If cache is younger than max_age and force_fresh is False, returns cached observation.
+        Screen capture is maintained in RAM (PIL Image) by default.
+        Disk persistence only occurs if save_to_disk=True or debug mode is enabled.
         """
         effective_max_age = max_age if max_age is not None else self.default_max_age
 
@@ -373,22 +379,24 @@ class VisionService:
         ):
             return self._cached_observation
 
-        # Capture new screen
+        # Capture new screen in RAM
         started = time.perf_counter()
         image = self.capture_screen_image(region=region)
         width, height = image.width, image.height
         window_title = self.get_active_window_title()
         img_hash = self.compute_image_hash(image)
 
-        # Save screenshot file
-        timestamp_str = time.strftime("%Y%m%d-%H%M%S")
-        file_path = self.output_dir / f"screenshot_{timestamp_str}_{int(time.time()*1000)%10000}.png"
-        try:
-            image.save(file_path)
-            saved_path_str = str(file_path.resolve())
-        except Exception as exc:
-            logger.warning("Could not persist screenshot to disk: %s", exc)
-            saved_path_str = None
+        # Save screenshot file ONLY if explicitly requested for debug/diagnostics
+        saved_path_str = None
+        if save_to_disk or getattr(self, "save_screenshots", False):
+            timestamp_str = time.strftime("%Y%m%d-%H%M%S")
+            file_path = self.output_dir / f"screenshot_{timestamp_str}_{int(time.time()*1000)%10000}.png"
+            try:
+                image.save(file_path)
+                saved_path_str = str(file_path.resolve())
+            except Exception as exc:
+                logger.warning("Could not persist screenshot to disk: %s", exc)
+                saved_path_str = None
 
         # Extract OCR elements if available
         ocr_status, elements = self.ocr.extract_elements(image)

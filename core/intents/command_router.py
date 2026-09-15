@@ -105,76 +105,24 @@ def build_search_url(target: str, original_text: str = "") -> str:
 
 
 def execute_control_pc(original_text: str, target: str) -> str:
-    lower = original_text.lower().strip()
-    import unicodedata
-    normalized = unicodedata.normalize("NFKD", lower)
-    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
-    
-    if normalized.startswith("klikni"):
-        send_agent_command("click")
-        return "Kliknuto."
-        
-    if normalized.startswith(("screenshot", "snimek obrazovky")):
-        res = send_agent_command("screenshot")
-        try:
-            data = json.loads(res)
-            if isinstance(data, dict) and "result" in data:
-                res_val = data["result"]
-                if isinstance(res_val, dict):
-                    path = res_val.get("path")
-                    return f"Snímek obrazovky byl uložen do: {path}"
-        except Exception:
-            pass
-        return "Snímek obrazovky byl pořízen."
-        
-    if normalized.startswith(("prepni", "dalsi", "dalsi skladbu")):
-        send_agent_command("press", "nexttrack")
-        return "Přepnuto na další skladbu."
-        
-    if normalized.startswith(("zastav", "pauzni", "stopni", "pauza")):
-        send_agent_command("press", "playpause")
-        return "Přehrávání pozastaveno/spuštěno."
-        
-    if normalized.startswith(("predchozi", "vrat", "vratit")):
-        send_agent_command("press", "prevtrack")
-        return "Přepnuto na předchozí skladbu."
-        
-    if normalized.startswith(("stiskni", "zmackni")):
-        if not target:
-            return "Omlouvám se, ale neuvedl jsi, kterou klávesu mám stisknout."
-            
-        target_norm = normalize_text(target)
-        if target_norm.startswith("klavesu "):
-            target = target[len("klavesu"):].strip()
-            
-        if "+" in target or " " in target:
-            keys = [part.strip() for part in target.replace("+", " ").split() if part.strip()]
-            send_agent_command("hotkey", keys)
-            return f"Stisknuta klávesová zkratka: {' + '.join(keys).upper()}."
-        else:
-            send_agent_command("press", target)
-            return f"Stisknuta klávesa {target.upper()}."
-            
-    return "Akce provedena."
+    """
+    Routes PC control commands through the unified JarvisRuntime pipeline.
+    """
+    from core.runtime import JarvisRuntime
+    goal = original_text.strip() or f"control pc {target}".strip()
+    runtime = JarvisRuntime()
+    result = runtime.run_task(goal)
+    return result.summary
 
 
 def execute_vision() -> str:
-    res = send_agent_command("read_screen")
-    try:
-        data = json.loads(res)
-        if isinstance(data, dict) and "result" in data:
-            result_val = data["result"]
-            if isinstance(result_val, dict):
-                text = result_val.get("text", "").strip()
-            else:
-                text = str(result_val).strip()
-            if text:
-                return f"Na obrazovce jsem přečetl:\n\n{text}"
-            else:
-                return "Na obrazovce se nepodařilo najít žádný čitelný text."
-    except Exception:
-        pass
-    return "Nepodařilo se přečíst obrazovku."
+    """
+    Routes screen reading through the unified JarvisRuntime pipeline.
+    """
+    from core.runtime import JarvisRuntime
+    runtime = JarvisRuntime()
+    result = runtime.run_task("Přečti obrazovku a popiš co na ní vidíš")
+    return result.summary
 
 
 def route_and_execute_command(parsed: ParsedCommand) -> str:

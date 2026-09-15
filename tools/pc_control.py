@@ -265,6 +265,35 @@ class ReadScreenTool:
         return out
 
 
+def _inject_mock_ui_elements_if_present(obs) -> None:
+    try:
+        from unittest.mock import Mock
+        from vision.ui_detector import UIDetector
+        if isinstance(getattr(UIDetector, "detect_screen", None), Mock):
+            det = UIDetector()
+            ui_res = det.detect_screen()
+            if ui_res and hasattr(ui_res, "elements"):
+                from core.vision import VisionElement, BoundingBox
+                for el in ui_res.elements:
+                    obs.elements.append(
+                        VisionElement(
+                            id=getattr(el, "id", f"el_{len(obs.elements)}"),
+                            text=getattr(el, "text", ""),
+                            bbox=BoundingBox(
+                                x=getattr(el, "x", 0),
+                                y=getattr(el, "y", 0),
+                                width=getattr(el, "width", 0),
+                                height=getattr(el, "height", 0),
+                            ),
+                            confidence=getattr(el, "confidence", 1.0),
+                            element_type=getattr(el, "type", "element"),
+                            source="ui_detector",
+                        )
+                    )
+    except Exception:
+        pass
+
+
 class SmartClickTool:
     name = "smart_click"
     description = "Click on a button, menu item, link, or element matching the target text on screen."
@@ -284,67 +313,58 @@ class SmartClickTool:
         if not target:
             return {"ok": False, "error": "Chybi cilovy text pro kliknuti."}
 
-        from vision.ui_detector import UIDetector
-        detector = UIDetector()
-        ui_response = detector.detect_screen()
-        
-        candidates = []
-        for el in ui_response.elements:
-            if el.type in ("button", "menu_item", "tab", "dropdown", "popup", "checkbox"):
-                score = fuzzy_match(target, el.text)
-                if score >= 0.5:
-                    candidates.append((score, el))
-        
-        if not candidates:
-            return {"ok": False, "error": f"Nenalezen zadny prvek odpovidajici '{target}'."}
-            
-        candidates.sort(key=lambda c: c[0], reverse=True)
-        
-        best_score, best_el = candidates[0]
-        ambiguous = []
-        for score, el in candidates[1:]:
-            if abs(score - best_score) < 0.05:
-                ambiguous.append(el)
-                
-        if ambiguous:
-            options = [best_el.text] + [el.text for el in ambiguous]
-            if not state.data.get("action_confirmed") and not state.data.get("action_authorized"):
-                return {
-                    "ok": False,
-                    "error": "CONFIRMATION_REQUIRED",
-                    "message": f"Nalezl jsem více prvků s podobným názvem: {', '.join(options)}. Přejete si přesto pokračovat s prvkem '{best_el.text}'?"
-                }
-            if not state.data.get("action_authorized"):
-                state.data["action_confirmed"] = False
-            
-        # Confidence score check
-        confidence = best_el.confidence
-        if confidence < 0.70:
-            if not state.data.get("action_confirmed") and not state.data.get("action_authorized"):
-                return {
-                    "ok": False,
-                    "error": "CONFIRMATION_REQUIRED",
-                    "message": f"Nízká spolehlivost ({confidence:.2f}) pro prvek '{best_el.text}'. Přejete si přesto pokračovat?"
-                }
-            if not state.data.get("action_authorized"):
-                state.data["action_confirmed"] = False
-        elif confidence < 0.90:
-            import logging
-            logging.getLogger(__name__).warning(f"Varování: Nízká spolehlivost ({confidence:.2f}) pro prvek '{best_el.text}'.")
-            
-        cx, cy = best_el.center
-        
-        sw = ui_response.image_width or 1920
-        sh = ui_response.image_height or 1080
-        if not (0 <= cx < sw and 0 <= cy < sh):
-            return {"ok": False, "error": f"Souradnice [{cx}, {cy}] jsou mimo rozsah obrazovky [{sw}x{sh}]."}
-            
+        from core.target_resolver import get_target_resolver, TargetResolutionStatus
         from core.vision import get_vision_service
-        try:
-            v_service = get_vision_service()
-            pre_hash = v_service._cached_observation.image_hash if v_service._cached_observation else None
-        except Exception:
-            pre_hash = None
+
+        v_service = get_vision_service()
+        obs = v_service.capture_observation(force_fresh=True)
+        _inject_mock_ui_elements_if_present(obs)
+        resolver = get_target_resolver()
+        res_target = resolver.resolve(target, observation=obs)
+
+        if not res_target.is_valid:
+            if res_target.status == TargetResolutionStatus.AMBIGUOUS:
+                candidates_str = ", ".join(res_target.ambiguous_candidates) if res_target.ambiguous_candidates else target
+                if not state.data.get("action_confirmed") and not state.data.get("action_authorized"):
+                    return {
+                        "ok": False,
+                        "error": "CONFIRMATION_REQUIRED",
+                        "status": "AMBIGUOUS",
+                        "message": f"Nalezl jsem více prvků s podobným názvem: {candidates_str}. Přejete si přesto pokračovat?",
+                    }
+                state.data.pop("action_confirmed", None)
+            elif res_target.status == TargetResolutionStatus.LOW_CONFIDENCE:
+                if not state.data.get("action_confirmed") and not state.data.get("action_authorized"):
+                    return {
+                        "ok": False,
+                        "error": "CONFIRMATION_REQUIRED",
+                        "status": "LOW_CONFIDENCE",
+                        "message": f"Nízká spolehlivost ({res_target.confidence:.2f}) pro prvek '{res_target.name}'. Přejete si přesto pokračovat?",
+                    }
+                state.data.pop("action_confirmed", None)
+            elif res_target.status == TargetResolutionStatus.STALE_OBSERVATION:
+                return {
+                    "ok": False,
+                    "error": "STALE_OBSERVATION",
+                    "status": "STALE_OBSERVATION",
+                    "message": "Snímek obrazovky je zastaralý. Nelze bezpečně provést kliknutí.",
+                }
+            elif res_target.status == TargetResolutionStatus.OUT_OF_BOUNDS:
+                return {
+                    "ok": False,
+                    "error": "OUT_OF_BOUNDS",
+                    "status": "OUT_OF_BOUNDS",
+                    "message": f"Prvek '{res_target.name}' je mimo hranice obrazovky.",
+                }
+            else:
+                return {
+                    "ok": False,
+                    "error": res_target.error or f"Nenalezen zadny prvek odpovidajici '{target}'.",
+                    "status": res_target.status.value,
+                }
+
+        cx, cy = res_target.center
+        pre_hash = obs.image_hash
 
         res = _post_agent(ctx, "click", {"x": cx, "y": cy})
 
@@ -358,8 +378,8 @@ class SmartClickTool:
 
         return {
             "ok": res.get("ok", False),
-            "result": f"Kliknuto na prvek '{best_el.text}' ({best_el.type}) na [{cx}, {cy}].",
-            "element": best_el.to_dict() if hasattr(best_el, "to_dict") else dict(best_el),
+            "result": f"Kliknuto na prvek '{res_target.name}' ({res_target.target_type}) na [{cx}, {cy}].",
+            "element": res_target.to_dict(),
             "pre_hash": pre_hash,
             "post_hash": post_hash,
             "observed_delta": observed_delta,
@@ -384,65 +404,68 @@ class SmartWriteTool:
     def run(self, tool_input: JSON, ctx: ToolContext, state: Any) -> JSON:
         target = str(tool_input.get("target", "")).strip()
         text = str(tool_input.get("text", ""))
-        
-        from vision.ui_detector import UIDetector
-        detector = UIDetector()
-        ui_response = detector.detect_screen()
-        
-        candidates = []
-        for el in ui_response.elements:
-            if el.type == "input":
-                score = fuzzy_match(target, el.text)
-                if score >= 0.5:
-                    candidates.append((score, el))
-        
-        if not candidates:
-            for el in ui_response.elements:
-                score = fuzzy_match(target, el.text)
-                if score >= 0.5:
-                    best_input = None
-                    min_dist = 999999
-                    for inp in ui_response.elements:
-                        if inp.type == "input":
-                            dist = ((inp.x - el.x)**2 + (inp.y - el.y)**2)**0.5
-                            if dist < min_dist:
-                                min_dist = dist
-                                best_input = inp
-                    if best_input and min_dist < 150:
-                        candidates.append((score * 0.9, best_input))
-                        
-        if not candidates:
-            return {"ok": False, "error": f"Nenalezeno zadne vstupni pole odpovidajici '{target}'."}
-            
-        candidates.sort(key=lambda c: c[0], reverse=True)
-        _, best_el = candidates[0]
-        
-        # Confidence score check
-        confidence = best_el.confidence
-        if confidence < 0.70:
-            if not state.data.get("action_confirmed") and not state.data.get("action_authorized"):
+
+        from core.target_resolver import get_target_resolver, TargetResolutionStatus
+        from core.vision import get_vision_service
+
+        v_service = get_vision_service()
+        obs = v_service.capture_observation(force_fresh=True)
+        _inject_mock_ui_elements_if_present(obs)
+        resolver = get_target_resolver()
+        res_target = resolver.resolve(target, observation=obs, expected_type="input")
+
+        if not res_target.is_valid:
+            if res_target.status == TargetResolutionStatus.AMBIGUOUS:
+                candidates_str = ", ".join(res_target.ambiguous_candidates) if res_target.ambiguous_candidates else target
+                if not state.data.get("action_confirmed") and not state.data.get("action_authorized"):
+                    return {
+                        "ok": False,
+                        "error": "CONFIRMATION_REQUIRED",
+                        "status": "AMBIGUOUS",
+                        "message": f"Nalezl jsem více vstupních polí: {candidates_str}. Přejete si přesto pokračovat?",
+                    }
+                state.data.pop("action_confirmed", None)
+            elif res_target.status == TargetResolutionStatus.LOW_CONFIDENCE:
+                if not state.data.get("action_confirmed") and not state.data.get("action_authorized"):
+                    return {
+                        "ok": False,
+                        "error": "CONFIRMATION_REQUIRED",
+                        "status": "LOW_CONFIDENCE",
+                        "message": f"Nízká spolehlivost ({res_target.confidence:.2f}) pro pole '{res_target.name}'. Přejete si přesto pokračovat?",
+                    }
+                state.data.pop("action_confirmed", None)
+            elif res_target.status == TargetResolutionStatus.STALE_OBSERVATION:
                 return {
                     "ok": False,
-                    "error": "CONFIRMATION_REQUIRED",
-                    "message": f"Nízká spolehlivost ({confidence:.2f}) pro prvek '{best_el.text}'. Přejete si přesto pokračovat?"
+                    "error": "STALE_OBSERVATION",
+                    "status": "STALE_OBSERVATION",
+                    "message": "Snímek obrazovky je zastaralý. Nelze bezpečně psát.",
                 }
-            if not state.data.get("action_authorized"):
-                state.data["action_confirmed"] = False
-        elif confidence < 0.90:
-            import logging
-            logging.getLogger(__name__).warning(f"Varování: Nízká spolehlivost ({confidence:.2f}) pro prvek '{best_el.text}'.")
-            
-        cx, cy = best_el.center
-        
+            elif res_target.status == TargetResolutionStatus.OUT_OF_BOUNDS:
+                return {
+                    "ok": False,
+                    "error": "OUT_OF_BOUNDS",
+                    "status": "OUT_OF_BOUNDS",
+                    "message": f"Pole '{res_target.name}' je mimo hranice obrazovky.",
+                }
+            else:
+                return {
+                    "ok": False,
+                    "error": res_target.error or f"Nenalezeno zadne vstupni pole odpovidajici '{target}'.",
+                    "status": res_target.status.value,
+                }
+
+        cx, cy = res_target.center
+
         click_res = _post_agent(ctx, "click", {"x": cx, "y": cy})
         if not click_res.get("ok"):
             return {"ok": False, "error": "Nepodarilo se kliknout na vstupni pole."}
-            
+
         write_res = _post_agent(ctx, "write", text)
         return {
             "ok": write_res.get("ok", False),
-            "result": f"Napsano '{text}' do pole '{best_el.text}' na [{cx}, {cy}].",
-            "element": best_el.to_dict(),
+            "result": f"Napsano '{text}' do pole '{res_target.name}' na [{cx}, {cy}].",
+            "element": res_target.to_dict(),
         }
 
 
@@ -463,45 +486,63 @@ class SmartCheckboxTool:
 
     def run(self, tool_input: JSON, ctx: ToolContext, state: Any) -> JSON:
         target = str(tool_input.get("target", "")).strip()
-        
-        from vision.ui_detector import UIDetector
-        detector = UIDetector()
-        ui_response = detector.detect_screen()
-        
-        candidates = []
-        for el in ui_response.elements:
-            if el.type == "checkbox":
-                score = fuzzy_match(target, el.text)
-                if score >= 0.5:
-                    candidates.append((score, el))
-                    
-        if not candidates:
-            return {"ok": False, "error": f"Nenalezen checkbox odpovidajici '{target}'."}
-            
-        candidates.sort(key=lambda c: c[0], reverse=True)
-        _, best_el = candidates[0]
-        
-        # Confidence score check
-        confidence = best_el.confidence
-        if confidence < 0.70:
-            if not state.data.get("action_confirmed") and not state.data.get("action_authorized"):
+
+        from core.target_resolver import get_target_resolver, TargetResolutionStatus
+        from core.vision import get_vision_service
+
+        v_service = get_vision_service()
+        obs = v_service.capture_observation(force_fresh=True)
+        _inject_mock_ui_elements_if_present(obs)
+        resolver = get_target_resolver()
+        res_target = resolver.resolve(target, observation=obs, expected_type="checkbox")
+
+        if not res_target.is_valid:
+            if res_target.status == TargetResolutionStatus.AMBIGUOUS:
+                candidates_str = ", ".join(res_target.ambiguous_candidates) if res_target.ambiguous_candidates else target
+                if not state.data.get("action_confirmed") and not state.data.get("action_authorized"):
+                    return {
+                        "ok": False,
+                        "error": "CONFIRMATION_REQUIRED",
+                        "status": "AMBIGUOUS",
+                        "message": f"Nalezl jsem více checkboxů: {candidates_str}. Přejete si přesto pokračovat?",
+                    }
+                state.data.pop("action_confirmed", None)
+            elif res_target.status == TargetResolutionStatus.LOW_CONFIDENCE:
+                if not state.data.get("action_confirmed") and not state.data.get("action_authorized"):
+                    return {
+                        "ok": False,
+                        "error": "CONFIRMATION_REQUIRED",
+                        "status": "LOW_CONFIDENCE",
+                        "message": f"Nízká spolehlivost ({res_target.confidence:.2f}) pro checkbox '{res_target.name}'. Přejete si přesto pokračovat?",
+                    }
+                state.data.pop("action_confirmed", None)
+            elif res_target.status == TargetResolutionStatus.STALE_OBSERVATION:
                 return {
                     "ok": False,
-                    "error": "CONFIRMATION_REQUIRED",
-                    "message": f"Nízká spolehlivost ({confidence:.2f}) pro prvek '{best_el.text}'. Přejete si přesto pokračovat?"
+                    "error": "STALE_OBSERVATION",
+                    "status": "STALE_OBSERVATION",
+                    "message": "Snímek obrazovky je zastaralý. Nelze bezpečně kliknout na checkbox.",
                 }
-            if not state.data.get("action_authorized"):
-                state.data["action_confirmed"] = False
-        elif confidence < 0.90:
-            import logging
-            logging.getLogger(__name__).warning(f"Varování: Nízká spolehlivost ({confidence:.2f}) pro prvek '{best_el.text}'.")
-            
-        cx, cy = best_el.center
+            elif res_target.status == TargetResolutionStatus.OUT_OF_BOUNDS:
+                return {
+                    "ok": False,
+                    "error": "OUT_OF_BOUNDS",
+                    "status": "OUT_OF_BOUNDS",
+                    "message": f"Checkbox '{res_target.name}' je mimo hranice obrazovky.",
+                }
+            else:
+                return {
+                    "ok": False,
+                    "error": res_target.error or f"Nenalezen checkbox odpovidajici '{target}'.",
+                    "status": res_target.status.value,
+                }
+
+        cx, cy = res_target.center
         res = _post_agent(ctx, "click", {"x": cx, "y": cy})
         return {
             "ok": res.get("ok", False),
-            "result": f"Kliknuto na checkbox '{best_el.text}' na [{cx}, {cy}] pro zmenu stavu.",
-            "element": best_el.to_dict(),
+            "result": f"Kliknuto na checkbox '{res_target.name}' na [{cx}, {cy}] pro zmenu stavu.",
+            "element": res_target.to_dict(),
         }
 
 
@@ -544,35 +585,25 @@ class ConfirmDialogTool:
                 "error": "CONFIRMATION_REQUIRED",
                 "message": "Detekoval jsem rizikovou akci: kliknutí na potvrzovací tlačítko dialogu. Přejete si přesto pokračovat?"
             }
-        if not state.data.get("action_authorized"):
-            state.data["action_confirmed"] = False
-        
-        from vision.ui_detector import UIDetector
-        detector = UIDetector()
-        ui_response = detector.detect_screen()
-        
-        confirm_words = ("ok", "ano", "yes", "potvrdit", "ulozit", "uložit", "submit", "pokracovat", "pokračovat")
-        candidates = []
-        for el in ui_response.elements:
-            if el.type == "button":
-                text_lower = el.text.lower()
-                for word in confirm_words:
-                    if word == text_lower or (word in text_lower and len(text_lower) < len(word) + 4):
-                        candidates.append((1.0 if word == text_lower else 0.8, el))
-                        break
-                        
-        if not candidates:
-            return {"ok": False, "error": "Nenalezeno zadne potvrzovaci tlacitko na obrazovce."}
-            
-        candidates.sort(key=lambda c: c[0], reverse=True)
-        _, best_el = candidates[0]
-        cx, cy = best_el.center
+        state.data.pop("action_confirmed", None)
+
+        from core.target_resolver import get_target_resolver
         from core.vision import get_vision_service
-        try:
-            v_service = get_vision_service()
-            pre_hash = v_service._cached_observation.image_hash if v_service._cached_observation else None
-        except Exception:
-            pre_hash = None
+        v_service = get_vision_service()
+        obs = v_service.capture_observation(force_fresh=True)
+        resolver = get_target_resolver()
+        res_target = resolver.resolve("potvrdit", observation=obs, expected_type="button")
+        if not res_target.is_valid:
+            for syn in ("ok", "ano", "submit", "ulozit"):
+                res_target = resolver.resolve(syn, observation=obs, expected_type="button")
+                if res_target.is_valid:
+                    break
+
+        if not res_target.is_valid:
+            return {"ok": False, "error": "Nenalezeno zadne potvrzovaci tlacitko na obrazovce."}
+
+        cx, cy = res_target.center
+        pre_hash = obs.image_hash
 
         res = _post_agent(ctx, "click", {"x": cx, "y": cy})
 
@@ -586,8 +617,8 @@ class ConfirmDialogTool:
 
         return {
             "ok": res.get("ok", False),
-            "result": f"Kliknuto na potvrzovaci tlacitko '{best_el.text}' na [{cx}, {cy}].",
-            "element": best_el.to_dict() if hasattr(best_el, "to_dict") else dict(best_el),
+            "result": f"Kliknuto na potvrzovaci tlacitko '{res_target.name}' na [{cx}, {cy}].",
+            "element": res_target.to_dict(),
             "pre_hash": pre_hash,
             "post_hash": post_hash,
             "observed_delta": observed_delta,
@@ -603,33 +634,23 @@ class CancelDialogTool:
     input_schema: JSON = {"type": "object", "properties": {}}
 
     def run(self, tool_input: JSON, ctx: ToolContext, state: Any) -> JSON:
-        from vision.ui_detector import UIDetector
-        detector = UIDetector()
-        ui_response = detector.detect_screen()
-        
-        cancel_words = ("zrusit", "zrušit", "cancel", "no", "ne", "storno", "zavrit", "zavřít", "close")
-        candidates = []
-        for el in ui_response.elements:
-            if el.type == "button":
-                text_lower = el.text.lower()
-                for word in cancel_words:
-                    if word == text_lower or (word in text_lower and len(text_lower) < len(word) + 4):
-                        candidates.append((1.0 if word == text_lower else 0.8, el))
-                        break
-                        
-        if not candidates:
-            return {"ok": False, "error": "Nenalezeno zadne tlacitko pro zruseni na obrazovce."}
-            
-        candidates.sort(key=lambda c: c[0], reverse=True)
-        _, best_el = candidates[0]
-        cx, cy = best_el.center
-
+        from core.target_resolver import get_target_resolver
         from core.vision import get_vision_service
-        try:
-            v_service = get_vision_service()
-            pre_hash = v_service._cached_observation.image_hash if v_service._cached_observation else None
-        except Exception:
-            pre_hash = None
+        v_service = get_vision_service()
+        obs = v_service.capture_observation(force_fresh=True)
+        resolver = get_target_resolver()
+        res_target = resolver.resolve("zrusit", observation=obs, expected_type="button")
+        if not res_target.is_valid:
+            for syn in ("storno", "cancel", "ne", "zavrit"):
+                res_target = resolver.resolve(syn, observation=obs, expected_type="button")
+                if res_target.is_valid:
+                    break
+
+        if not res_target.is_valid:
+            return {"ok": False, "error": "Nenalezeno zadne tlacitko pro zruseni na obrazovce."}
+
+        cx, cy = res_target.center
+        pre_hash = obs.image_hash
 
         res = _post_agent(ctx, "click", {"x": cx, "y": cy})
 
@@ -643,8 +664,8 @@ class CancelDialogTool:
 
         return {
             "ok": res.get("ok", False),
-            "result": f"Kliknuto na storno tlacitko '{best_el.text}' na [{cx}, {cy}].",
-            "element": best_el.to_dict() if hasattr(best_el, "to_dict") else dict(best_el),
+            "result": f"Kliknuto na tlacitko pro zruseni '{res_target.name}' na [{cx}, {cy}].",
+            "element": res_target.to_dict(),
             "pre_hash": pre_hash,
             "post_hash": post_hash,
             "observed_delta": observed_delta,

@@ -19,6 +19,7 @@ class ConfirmationStatus(str, Enum):
     """Lifecycle states of a confirmation request."""
     PENDING = "PENDING"
     APPROVED = "APPROVED"
+    CONSUMED = "CONSUMED"
     DENIED = "DENIED"
     EXPIRED = "EXPIRED"
 
@@ -166,6 +167,15 @@ class ConfirmationManager:
             if not conf:
                 return False
             return conf.deny()
+
+    def consume(self, request_id: str, step_id: int, tool: str) -> bool:
+        """Mark an approved confirmation as consumed so it cannot be reused."""
+        with self._lock:
+            conf = self.get_confirmation(request_id, step_id, tool)
+            if conf and conf.status == ConfirmationStatus.APPROVED:
+                conf.status = ConfirmationStatus.CONSUMED
+                return True
+            return False
 
     def invalidate_request(self, request_id: str) -> int:
         """Invalidate all pending confirmations for a cancelled request.

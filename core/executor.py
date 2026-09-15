@@ -28,6 +28,7 @@ JSON = Dict[str, Any]
 class StepExecutionStatus(str, Enum):
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
+    UNKNOWN = "UNKNOWN"
     PAUSED = "PAUSED"
     WAITING_FOR_CONFIRMATION = "WAITING_FOR_CONFIRMATION"
     CANCELLED = "CANCELLED"
@@ -84,7 +85,7 @@ class StepResult(dict):
         return (
             self.status == StepExecutionStatus.SUCCESS
             and bool(self.output.get("ok", False))
-            and self.verification_status != "FAILED"
+            and self.verification_status not in ("FAILED", "UNKNOWN")
         )
 
 
@@ -575,7 +576,7 @@ class Executor:
                         )
 
                     v_res: VerificationResult = self.verifier.verify_step(
-                        step, out, state=self.state, ctx=self.request_context
+                        step, out, state=self.state, ctx=self.request_context, tool_ctx=self.ctx
                     )
                     verification_result_obj = v_res
 
@@ -809,7 +810,7 @@ class Executor:
                     if repaired and not self._is_cancelled():
                         if self.verifier is None:
                             self.verifier = StepVerifierRegistry()
-                        re_v_res = self.verifier.verify_step(step, out, state=self.state, ctx=self.request_context)
+                        re_v_res = self.verifier.verify_step(step, out, state=self.state, ctx=self.request_context, tool_ctx=self.ctx)
                         if re_v_res.is_failed():
                             repaired = False
                             error_msg = f"Re-verification failed after repair: {re_v_res.message or re_v_res.observed}"
@@ -967,12 +968,6 @@ class Executor:
                 if self.on_step_update:
                     self.on_step_update(step_idx, "completed")
 
-            # Invariant check: only reached if step succeeded natively or was successfully auto-repaired
-            if self._is_cancelled():
-                print(f"[EXECUTOR] Execution cancelled right after step completion at step {step_idx+1}")
-                self.state.data.pop("action_authorized", None)
-                break
-
             # State updates for successful step
             self._update_state_after_step(step_idx, tool_name, tool_input, out)
 
@@ -994,18 +989,28 @@ class Executor:
             print("[TOOL OUTPUT]", out)
             print("[STATE]", self.state.snapshot())
 
+            step_status = StepExecutionStatus.UNKNOWN if verification_status == "UNKNOWN" else StepExecutionStatus.SUCCESS
+            exec_status = "unknown" if verification_status == "UNKNOWN" else "completed"
+
             step_res = StepResult(
                 step_index=step_idx + 1,
                 tool=tool_name,
                 input=tool_input,
                 output=out,
-                status=StepExecutionStatus.SUCCESS,
-                execution_status="completed",
+                status=step_status,
+                execution_status=exec_status,
                 verification_status=verification_status,
                 verification_evidence=verification_evidence,
                 state_snapshot=self.state.snapshot(),
             )
             results.append(step_res)
+
+            # Invariant check: only reached if step succeeded natively or was successfully auto-repaired
+            if self._is_cancelled():
+                print(f"[EXECUTOR] Execution cancelled right after step completion at step {step_idx+1}")
+                self.state.data.pop("action_authorized", None)
+                self.state.data.pop("action_confirmed", None)
+                break
             audit_logger.log(
                 request_id=req_id,
                 step_id=step_number,
@@ -1015,11 +1020,14 @@ class Executor:
                 risk=str(eval_res.risk),
                 decision=str(eval_res.decision),
                 confirmation_status=confirmation_status_str,
-                execution_status="SUCCESS",
+                execution_status="SUCCESS" if step_status == StepExecutionStatus.SUCCESS else str(step_status.value),
                 verification_status=verification_status,
                 resource=eval_res.target_resource,
             )
             self.state.data.pop("action_authorized", None)
+            self.state.data.pop("action_confirmed", None)
+            if cm and req_id:
+                cm.consume(req_id, step_number, tool_name)
             step_idx += 1
         return results
 

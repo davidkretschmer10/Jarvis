@@ -67,6 +67,9 @@ class GuiController(QObject):
         self.event_bus.on("verification_failed", self._on_verification_failed)
         self.event_bus.on("step_repair", self._on_step_repair)
         self.event_bus.on("replanning_started", self._on_replanning_started)
+        self.event_bus.on("step_started", self._on_step_started)
+        self.event_bus.on("request_waiting_for_user", self._on_waiting_for_user)
+        self.event_bus.on("request_cancelled", self._on_request_cancelled)
         self.chats = load_json(CHATS_FILE)
 
         for chat in self.chats:
@@ -123,6 +126,16 @@ class GuiController(QObject):
 
     def _on_replanning_started(self, data):
         self.status_changed.emit("Přeplánovávám...")
+
+    def _on_step_started(self, data):
+        tool = data.get("tool", "") if isinstance(data, dict) else ""
+        self.status_changed.emit(f"Provádím ({tool})..." if tool else "Provádím...")
+
+    def _on_waiting_for_user(self, data):
+        self.status_changed.emit("Čekám na potvrzení...")
+
+    def _on_request_cancelled(self, data):
+        self.status_changed.emit("Zrušeno")
 
     def refresh_ollama_status(self):
         def status_task():

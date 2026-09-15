@@ -65,7 +65,13 @@ class VisionEngine:
         started = time.perf_counter()
 
         try:
-            response = requests.post(
+            from ai.engine import get_ollama_session
+            session = get_ollama_session()
+        except ImportError:
+            session = requests.Session()
+
+        try:
+            response = session.post(
                 f"{self.config.ollama_url.rstrip('/')}/api/generate",
                 json=payload,
                 timeout=self.config.timeout_seconds,

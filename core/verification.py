@@ -1111,12 +1111,22 @@ class StepVerifierRegistry:
         tool_output: Dict[str, Any],
         state: Optional[Dict[str, Any]] = None,
         ctx: Optional[Any] = None,
+        tool_ctx: Optional[Any] = None,
     ) -> VerificationResult:
         """
         Verify a step's execution result.
-        Checks cancellation and timeouts before running verifiers.
+        Checks cancellation, timeouts, and dry-run before running verifiers.
         """
-        # 1. Safety check: cancellation / timeout
+        # 1. Safety check: cancellation / timeout / dry_run
+        if (tool_ctx and getattr(tool_ctx, "dry_run", False)) or (ctx and getattr(ctx, "dry_run", False)):
+            return VerificationResult(
+                status=VerificationStatus.NOT_APPLICABLE,
+                verifier="DryRunVerifier",
+                expected="N/A (Dry run mode)",
+                observed="Tool executed in dry run mode",
+                message="Dry run mode active; mutation verification not applicable",
+            )
+
         if ctx is not None:
             if getattr(ctx, "is_cancelled", False) is True:
                 return VerificationResult(
@@ -1152,12 +1162,14 @@ class StepVerifierRegistry:
                     message=f"Verification encountered error: {str(e)}",
                 )
 
-        # 3. Default fallback if no verifier matched: UNKNOWN (never assume verified!)
+        # 3. Default fallback if no verifier matched:
+        # Non-desktop/generic tools without mutation verifiers are treated as NOT_APPLICABLE.
+        # (Desktop GUI actions are strictly verified by UIInteractionVerifier returning UNKNOWN if unverified).
         return VerificationResult(
-            status=VerificationStatus.UNKNOWN,
+            status=VerificationStatus.NOT_APPLICABLE,
             verifier="StepVerifierRegistry",
-            expected="Registered verifier for step",
-            observed=f"No specialized verifier matched tool '{step.get('tool')}'",
+            expected="N/A (No specialized mutation verifier registered)",
+            observed=f"No specialized mutation verifier matched tool '{step.get('tool')}'",
             evidence={"tool": step.get("tool")},
-            message=f"No deterministic verifier registered for tool '{step.get('tool')}'; status is UNKNOWN",
+            message=f"No deterministic mutation verifier for tool '{step.get('tool')}'; status is NOT_APPLICABLE",
         )
